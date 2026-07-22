@@ -1,0 +1,11 @@
+# One Tibetan probe per line. Keep NFD text unchanged.
+# Ordinary letters and vowels
+ཀ་ཁ་ག་ང་ ཅ་ཉ་ཏ་ད་ན་ པ་བ་མ་ ཙ་ཚ་ཛ་ ཝ་ཞ་ཟ་འ་ཡ་ར་ལ་ཤ་ས་ཧ་ཨ།
+ཀི་ཀུ་ཀེ་ཀོ་ རྗེ་ རྒྱལ་ མཁྱེན་ བསྒྲུབ།
+# Superscripts, subscripts, and ordinary natural text
+ཀྱ་ཀྲ་ཀླ་ སྐ་སྒ་སྟ་སྤ་ རྐ་རྒ་ལྟ་ བརྒྱ།
+ཀུན་མཁྱེན་གྲུབ་དངོས་གཅིག་མཆོག་རྗེ་ཉིད་སྟོན།
+# Complex Sanskrit-style stacks and marks
+རྒྦྷྱཱ་ རྐྵྱཱ་ དྡྷྭེ་ མྔྦྱཾ་ བྷྲཱུྃ་ ཀྵྨྼྻུཾ།
+# Tibetan punctuation and digits
+༄༅། ། ༈ ༠ ༑ ༠༡༢༣༤༥༦༧༨༩

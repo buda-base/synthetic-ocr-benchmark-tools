@@ -90,6 +90,81 @@ Small with/without smoke plan (~2 images per font; even=`with`, odd=`none`):
 
 The planner rejects a `(font, chunk)` candidate if any Tibetan stack in the whole chunk is unsupported by that font. Unknown stacks are treated as unsupported. It uses `ok=True` and, when present, `placement_warning_count=0`.
 
+## 2b. Review font-level augmentation
+
+Font augmentation is experimental and remains separate from dataset rendering until
+the generated forms pass manual Tibetan review. Generate the first conservative,
+single-axis review batch with:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_font_augmentation_audit.py
+```
+
+This selects a taxonomy-stratified sample of fonts and writes a contact sheet,
+JSON manifest, editable `review.csv`, individual PNGs, and cached font variants
+under `synthetic_benchmark/out/font_augmentation_review/round1/`.
+
+Each contact-sheet row shows the unmodified face followed by mild width, slant,
+and stroke-weight variants. Automated HarfBuzz checks reject any variant that
+introduces a shaping or placement regression on a source-supported probe. Record
+`accept`, `borderline`, or `reject` in `review.csv`, with optional reason tags
+and notes. Re-running the command preserves those three review columns.
+
+Use `--font BASENAME` (repeatable) to review specific faces, or `--max-fonts N`
+to change the default batch size. The reviewed probe set is
+`data/font_augmentation/probes.txt`. Variants are deterministic and cached by
+source-font hash, TTC face index, operation, and parameter.
+
+After reviewing round 1, generate the wider-width, stronger negative-slant grid
+with:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_font_augmentation_audit.py \
+  --preset round2
+```
+
+Round 2 tests width scales `0.80`, `0.88`, `1.15`, and `1.25`, plus slants of
+`-10°` and `-14°`. Positive slant and weight changes are omitted from this pass.
+
+Round 3 independently tests the thickness of vertical and horizontal stems:
+
+```bash
+/home/eroux/pvenvs/1/bin/pip install skia-pathops
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_font_augmentation_audit.py \
+  --preset round3
+```
+
+It applies directional contour changes of `-0.015em` and `+0.015em` to vary
+vertical-stroke and horizontal-stroke thickness independently while minimizing
+change along the other axis.
+
+Round 4 fixes counter/hole winding after directional erosion and tests a
+stronger approximately 30% stem-width change:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_font_augmentation_audit.py \
+  --preset round4
+```
+
+Its directional contour values are `-0.030em` and `+0.030em`.
+
+To produce a presentation sheet with an Uchen and an Ume font, each shown
+unmodified and with five combined extreme variants:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_font_augmentation_demo.py
+```
+
+This writes `out/font_augmentation_demo/font_augmentation_demo.jpg` and a
+provenance/QC manifest. The compact demo omits the fourth content line from the
+review probe text.
+
+Audit and demo renders also run raster QC against each font's baseline. Variants
+are rejected when they lose too much ink density, lose enclosed counters
+(including black-filled holes), or fragment into substantially more connected
+components. Combined transforms apply directional stroke changes before
+FontForge width/slant operations to preserve counter topology.
+
 ## 3. Render Pecha JPEG/Alignment Pairs
 
 ```bash
