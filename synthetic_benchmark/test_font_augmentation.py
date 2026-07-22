@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import random
 import sys
 
 from fontTools.fontBuilder import FontBuilder
@@ -13,6 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from font_augmentation import AugmentationSpec, variant_cache_key
 from font_augmentation_raster_qc import compare_rasters
+from font_augmentation_runtime import (
+    RuntimeVariant,
+    assign_variants_to_rows,
+    sample_augmentation_specs,
+)
+from render_batches import assign_batches, fontspec_options
 
 
 def make_minimal_font(path: Path) -> None:
@@ -90,6 +97,63 @@ class RasterQCTests(unittest.TestCase):
             variant.save(variant_path)
             result = compare_rasters(baseline_path, variant_path)
             self.assertIn("counter_loss_or_black_fill", result["warnings"])
+
+
+class RuntimeAugmentationTests(unittest.TestCase):
+    def test_sampled_policy_stays_within_reviewed_ranges(self) -> None:
+        rng = random.Random(13)
+        for _ in range(500):
+            specs = sample_augmentation_specs(rng)
+            values = {spec.operation: spec.value for spec in specs}
+            self.assertGreaterEqual(values["width"], 0.80)
+            self.assertLessEqual(values["width"], 1.20)
+            self.assertGreaterEqual(values["slant"], -14.0)
+            self.assertLessEqual(values["slant"], 0.0)
+            operations = [spec.operation for spec in specs]
+            self.assertLess(operations.index("width"), operations.index("slant"))
+            for operation in ("vertical_stroke", "horizontal_stroke"):
+                if operation in values:
+                    self.assertGreaterEqual(values[operation], -0.015)
+                    self.assertLessEqual(values[operation], 0.030)
+                    self.assertLess(operations.index(operation), operations.index("width"))
+
+    def test_variant_assignment_is_stable_by_image_id(self) -> None:
+        variants = [
+            RuntimeVariant(
+                variant_id=f"v{index}",
+                path=Path(f"/tmp/v{index}.ttf"),
+                specs=(AugmentationSpec("width", 0.9 + index * 0.1),),
+                raster_qc={},
+                provenance=(),
+            )
+            for index in range(2)
+        ]
+        rows = [
+            {"image_id": image_id, "font_abs_path": "/source.ttf", "ttc_face_index": ""}
+            for image_id in (4, 2, 3)
+        ]
+        assigned = assign_variants_to_rows(rows, variants)
+        by_id = {row["image_id"]: row["font_augmentation_id"] for row in assigned}
+        self.assertEqual(by_id, {2: "v1", 3: "v0", 4: "v1"})
+
+    def test_lualatex_batches_and_fontspec_use_runtime_variant(self) -> None:
+        rows = []
+        for image_id, variant_id in ((1, "abc"), (2, "def"), (3, "abc")):
+            rows.append(
+                {
+                    "image_id": image_id,
+                    "basename": "Example",
+                    "ttc_face_index": "2",
+                    "font_augmentation_id": variant_id,
+                    "render_font_abs_path": f"/tmp/{variant_id}.ttf",
+                    "render_ttc_face_index": 0,
+                }
+            )
+        batches = assign_batches(rows, 100)
+        self.assertEqual(len(batches), 2)
+        options = fontspec_options(rows[0])
+        self.assertIn("UprightFont={abc.ttf}", options)
+        self.assertIn("FontIndex=0", options)
 
 
 if __name__ == "__main__":

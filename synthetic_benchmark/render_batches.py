@@ -24,6 +24,8 @@ import pyarrow.parquet as pq
 from PIL import Image
 from tqdm import tqdm
 
+from font_augmentation_runtime import DEFAULT_PROBES as DEFAULT_FONT_AUGMENTATION_PROBES
+from font_augmentation_runtime import prepare_font_variants
 from shorthand_aug import (
     DEFAULT_DENYLIST_CSV,
     DEFAULT_SHORTHANDS_CSV,
@@ -88,6 +90,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shorthand-max-per-100", type=float, default=4.0)
     parser.add_argument("--shorthand-seed", type=int, default=13)
+    parser.add_argument(
+        "--font-augmentation-variants",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Generate N validated temporary outline variants per source font and "
+            "distribute that font's pages across them (default: disabled)."
+        ),
+    )
+    parser.add_argument("--font-augmentation-seed", type=int, default=13)
+    parser.add_argument(
+        "--font-augmentation-probes",
+        type=Path,
+        default=DEFAULT_FONT_AUGMENTATION_PROBES,
+    )
+    parser.add_argument("--fontforge", default="fontforge")
+    parser.add_argument("--hb-view", default="hb-view")
+    parser.add_argument(
+        "--keep-font-augmentation-cache",
+        action="store_true",
+        help="Keep generated temporary font files and QC renders for debugging.",
+    )
     parser.add_argument("--lualatex", default="lualatex")
     parser.add_argument("--pdftoppm", default="pdftoppm")
     parser.add_argument("--force", action="store_true")
@@ -127,6 +152,10 @@ def fmt_dim(value: float) -> str:
 
 def resolve_font_path(row: dict[str, object]) -> Path:
     """Resolve font paths portably from render plans copied across machines."""
+    render_font_path = str(row.get("render_font_abs_path") or "").strip()
+    if render_font_path:
+        return Path(render_font_path)
+
     rel_font_path = str(row.get("font_path") or "").strip()
     if rel_font_path:
         candidate = BENCHMARK_DIR / rel_font_path
@@ -150,7 +179,11 @@ def fontspec_options(row: dict[str, object]) -> str:
         "Renderer=HarfBuzz",
         "RawFeature={script=tibt}",
     ]
-    face_index = str(row.get("ttc_face_index") or "").strip()
+    face_index = str(
+        row.get("render_ttc_face_index")
+        if row.get("render_ttc_face_index") is not None
+        else row.get("ttc_face_index") or ""
+    ).strip()
     if face_index:
         parts.append(f"FontIndex={face_index}")
     return ",\n  ".join(parts)
@@ -706,6 +739,12 @@ def write_text_and_catalog(
                 "unique_stack_count": row["unique_stack_count"],
                 "shorthand_count": row.get("shorthand_count", 0),
                 "shorthand_mode": row.get("shorthand_mode") or "none",
+                "font_augmentation_id": row.get("font_augmentation_id") or "",
+                "font_augmentation_specs": row.get("font_augmentation_specs") or "",
+                "font_augmentation_source_file": row.get("font_augmentation_source_file") or "",
+                "font_augmentation_source_face_index": (
+                    row.get("font_augmentation_source_face_index") or ""
+                ),
             }
         )
     return next_output_id
@@ -909,17 +948,26 @@ def render_batch(
 
 
 def assign_batches(rows: list[dict[str, object]], batch_size: int) -> list[list[dict[str, object]]]:
-    by_font: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+    by_font: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
-        by_font[(str(row["basename"]), str(row.get("ttc_face_index") or ""))].append(row)
+        by_font[
+            (
+                str(row["basename"]),
+                str(row.get("ttc_face_index") or ""),
+                str(row.get("font_augmentation_id") or ""),
+            )
+        ].append(row)
     batches: list[list[dict[str, object]]] = []
-    for (basename, face_index), group in sorted(by_font.items()):
+    for (basename, face_index, augmentation_id), group in sorted(by_font.items()):
         group.sort(key=lambda row: int(row["image_id"]))
         for batch_i in range(math.ceil(len(group) / batch_size)):
             chunk = group[batch_i * batch_size : (batch_i + 1) * batch_size]
             first_image_id = int(chunk[0]["image_id"])
             last_image_id = int(chunk[-1]["image_id"])
-            batch_id = f"{basename}_{face_index or 'face'}_{first_image_id:08d}_{last_image_id:08d}".replace("/", "_")
+            font_key = augmentation_id[:10] if augmentation_id else face_index or "face"
+            batch_id = (
+                f"{basename}_{font_key}_{first_image_id:08d}_{last_image_id:08d}"
+            ).replace("/", "_")
             for page_i, row in enumerate(chunk, start=1):
                 row["batch_id"] = batch_id
                 row["page_in_batch"] = page_i
@@ -1153,6 +1201,8 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     else None
                 ),
                 "suggested_split": row.get("suggested_split") or "",
+                "font_augmentation_id": row.get("font_augmentation_id") or "",
+                "font_augmentation_specs": row.get("font_augmentation_specs") or "",
             }
             for row in sorted(group_rows, key=catalog_sort_key)
         ]
@@ -1180,7 +1230,8 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "grayscale JPEG images. The rendered transcription preserves line breaks recovered "
         "from LuaTeX line markers. The alignment parquet files contain page-to-text rows "
         "plus synthetic metadata: `font_name`, `script_8`, `etext_source`, "
-        "`stack_difficulty_score`, and `suggested_split`.\n\n"
+        "`stack_difficulty_score`, `suggested_split`, and—when enabled—deterministic "
+        "`font_augmentation_id` and `font_augmentation_specs` values.\n\n"
         "## Planning and Splits\n\n"
         "The render plan aims for a balanced distribution across the 8-way Tibetan script "
         "classification (`script_8`) while keeping image volumes pure with respect to "
@@ -1377,6 +1428,46 @@ def load_shorthand_runtime(args: argparse.Namespace) -> None:
     )
 
 
+def render_planned_rows(
+    rows: list[dict[str, object]],
+    args: argparse.Namespace,
+    existing_catalog_rows: list[dict[str, object]],
+) -> None:
+    batches = assign_batches(rows, args.batch_size)
+    next_output_id = next_output_id_from_catalog(existing_catalog_rows)
+    if args.jobs > 1:
+        new_catalog_rows, ok_batches = render_batches_parallel(
+            batches,
+            args,
+            start_output_id=next_output_id,
+            catalog_rows=existing_catalog_rows,
+        )
+    else:
+        new_catalog_rows = []
+        ok_batches = 0
+        for _batch_index, batch in enumerate(tqdm(batches, desc="Render batches", unit="batch")):
+            batch_id = str(batch[0]["batch_id"])
+            ok, fragment_rows = render_batch_with_split_retry(
+                batch,
+                args,
+                next_output_id,
+                batch_id=batch_id,
+            )
+            if ok:
+                ok_batches += 1
+                fragment_rows = filter_existing_image_rows(fragment_rows, args.out_dir)
+                new_catalog_rows.extend(fragment_rows)
+                next_output_id = next_output_id_from_catalog(existing_catalog_rows + new_catalog_rows)
+                write_catalog_fragment(args.out_dir, str(batch[0]["batch_id"]), fragment_rows)
+    catalog_rows = filter_existing_image_rows(
+        dedupe_catalog_rows(existing_catalog_rows + new_catalog_rows),
+        args.out_dir,
+    )
+    write_benchmark_metadata(args.out_dir, catalog_rows)
+    print(f"Rendered {len(new_catalog_rows)} new image(s) in {ok_batches}/{len(batches)} successful batch(es)")
+    print(f"Benchmark metadata now has {len(catalog_rows)} image(s)")
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1410,39 +1501,44 @@ def main() -> None:
         skipped = before - len(rows)
         if skipped:
             print(f"Resuming: skipped {skipped} already rendered plan row(s)")
-    batches = assign_batches(rows, args.batch_size)
-    next_output_id = next_output_id_from_catalog(existing_catalog_rows)
-    if args.jobs > 1:
-        new_catalog_rows, ok_batches = render_batches_parallel(
-            batches,
-            args,
-            start_output_id=next_output_id,
-            catalog_rows=existing_catalog_rows,
-        )
-    else:
-        new_catalog_rows = []
-        ok_batches = 0
-        for batch_index, batch in enumerate(tqdm(batches, desc="Render batches", unit="batch")):
-            batch_id = str(batch[0]["batch_id"])
-            ok, fragment_rows = render_batch_with_split_retry(
-                batch,
-                args,
-                next_output_id,
-                batch_id=batch_id,
+    if args.font_augmentation_variants < 0:
+        raise SystemExit("--font-augmentation-variants cannot be negative")
+
+    augmentation_cache: Path | None = None
+    rendering_finished = False
+    try:
+        if args.font_augmentation_variants:
+            augmentation_cache = args.out_dir / ".font_augmentation_cache"
+            rows, manifest = prepare_font_variants(
+                rows,
+                variants_per_font=args.font_augmentation_variants,
+                seed=args.font_augmentation_seed,
+                cache_dir=augmentation_cache,
+                probes_path=args.font_augmentation_probes,
+                fontforge_bin=args.fontforge,
+                hb_view_bin=args.hb_view,
             )
-            if ok:
-                ok_batches += 1
-                fragment_rows = filter_existing_image_rows(fragment_rows, args.out_dir)
-                new_catalog_rows.extend(fragment_rows)
-                next_output_id = next_output_id_from_catalog(existing_catalog_rows + new_catalog_rows)
-                write_catalog_fragment(args.out_dir, str(batch[0]["batch_id"]), fragment_rows)
-    catalog_rows = filter_existing_image_rows(
-        dedupe_catalog_rows(existing_catalog_rows + new_catalog_rows),
-        args.out_dir,
-    )
-    write_benchmark_metadata(args.out_dir, catalog_rows)
-    print(f"Rendered {len(new_catalog_rows)} new image(s) in {ok_batches}/{len(batches)} successful batch(es)")
-    print(f"Benchmark metadata now has {len(catalog_rows)} image(s)")
+            manifest_path = args.out_dir / "font_augmentation_manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"Font augmentation enabled: {args.font_augmentation_variants} "
+                f"variant(s) for each of {manifest['font_count']} source font(s)"
+            )
+            print(f"Wrote {manifest_path}")
+        render_planned_rows(rows, args, existing_catalog_rows)
+        rendering_finished = True
+    finally:
+        if (
+            rendering_finished
+            and augmentation_cache is not None
+            and augmentation_cache.exists()
+            and not args.keep_font_augmentation_cache
+        ):
+            shutil.rmtree(augmentation_cache)
+            print(f"Removed temporary font augmentation cache: {augmentation_cache}")
 
 
 if __name__ == "__main__":

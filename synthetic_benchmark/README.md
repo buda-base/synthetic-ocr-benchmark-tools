@@ -165,6 +165,37 @@ are rejected when they lose too much ink density, lose enclosed counters
 components. Combined transforms apply directional stroke changes before
 FontForge width/slant operations to preserve counter topology.
 
+After review, enable the same policy directly in page generation:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_batches.py \
+  synthetic_benchmark/out/render_plan.parquet \
+  --out-dir synthetic_benchmark/out/dataset \
+  --font-augmentation-variants 20 \
+  --jobs 4
+```
+
+`--font-augmentation-variants N` is disabled by default. When enabled, the
+renderer generates and validates `N` deterministic combined variants for every
+source font represented in the remaining render-plan rows. Pages for that font
+are distributed stably across the pool and LuaLaTeX batches are split by variant.
+The approved policy samples width from `0.80–1.20`, uses a near-upright-weighted
+negative slant distribution ending at `-14°`, and applies conservative
+directional stroke changes to half of variants.
+
+Generated fonts and QC probe renders live temporarily under
+`OUT_DIR/.font_augmentation_cache/` and are removed in a `finally` block after
+rendering. Pass `--keep-font-augmentation-cache` for debugging. The persistent
+`OUT_DIR/font_augmentation_manifest.json`, catalog fragments, and alignment
+metadata retain each variant id and its exact operation labels, so page
+provenance does not depend on keeping the TTF files. Re-running with the same
+source fonts and `--font-augmentation-seed` regenerates the same pools.
+
+Before a variant enters a page-rendering pool it must reopen as a valid font,
+avoid new hard shaping failures on the Tibetan probe set, render successfully,
+and pass the ink-density/counter/component raster checks. Affine-sensitive
+placement heuristics remain part of manual review rather than the runtime gate.
+
 ## 3. Render Pecha JPEG/Alignment Pairs
 
 ```bash
