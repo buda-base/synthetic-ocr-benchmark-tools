@@ -29,14 +29,14 @@ The font filter excludes only `script_id=239`, which is the decorative digital-f
 ## 1. Build BoCorpus Chunks
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/synthetic_benchmark/build_bocorpus_chunks.py \
-  --output scripts/synthetic_benchmark/out/bocorpus_chunks.parquet
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_bocorpus_chunks.py \
+  --output synthetic_benchmark/out/bocorpus_chunks.parquet
 ```
 
 Useful smoke-test options:
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/synthetic_benchmark/build_bocorpus_chunks.py \
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_bocorpus_chunks.py \
   --limit-rows 200 \
   --limit-chunks 1000
 ```
@@ -45,27 +45,65 @@ Chunks are page-sized text samples with `bocorpus_row`, `char_start`, `char_end`
 
 Pass `--force-download` to refresh the cached BoCorpus parquet, or `--bocorpus-parquet /path/to/bo_corpus.parquet` to use a local file.
 
+## 1b. Shorthand lexicon + coverage probes (optional linguistic augmentation)
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_shorthand_lexicon.py
+/home/eroux/pvenvs/1/bin/python coverage_report/export_shorthand_stacks.py
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py --mode both
+```
+
+Then review auto-ok shorthand renderings before enabling injection:
+
+```bash
+/home/eroux/pvenvs/1/bin/python coverage_report/render_shorthand_audit.py \
+  coverage_report/out/stack_support.parquet \
+  --kind shorthand-pass \
+  --sample-size 80
+```
+
+Reject bad cases via heuristics or `data/shorthands/denylist.csv`. Shorthand injection stays off until you pass `--enable-shorthands` at render time.
+
 ## 2. Build Render Plan
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/synthetic_benchmark/build_render_plan.py \
-  --chunks scripts/synthetic_benchmark/out/bocorpus_chunks.parquet \
-  --support-parquet scripts/coverage_report/out/stack_support.parquet \
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_render_plan.py \
+  --chunks synthetic_benchmark/out/bocorpus_chunks.parquet \
+  --support-parquet coverage_report/out/stack_support.parquet \
   --target-images 500000 \
-  --output scripts/synthetic_benchmark/out/render_plan.parquet
+  --output synthetic_benchmark/out/render_plan.parquet
 ```
+
+For dense ume shorthand pages (every other ume image), also pass `--oversample-ume-dense` so those plan rows start from ~2× source text before contraction.
 
 The planner rejects a `(font, chunk)` candidate if any Tibetan stack in the whole chunk is unsupported by that font. Unknown stacks are treated as unsupported. It uses `ok=True` and, when present, `placement_warning_count=0`.
 
 ## 3. Render Pecha JPEG/Alignment Pairs
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/synthetic_benchmark/render_batches.py \
-  scripts/synthetic_benchmark/out/render_plan.parquet \
-  --out-dir scripts/synthetic_benchmark/out/dataset \
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_batches.py \
+  synthetic_benchmark/out/render_plan.parquet \
+  --out-dir synthetic_benchmark/out/dataset \
   --batch-size 100 \
   --jobs 4
 ```
+
+After the shorthand coverage review gate, enable linguistic augmentation:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_batches.py \
+  synthetic_benchmark/out/render_plan.parquet \
+  --enable-shorthands \
+  --support-parquet coverage_report/out/stack_support.parquet \
+  --out-dir synthetic_benchmark/out/dataset
+```
+
+Script policy:
+
+- **uchen**: sparse random replacements, capped at about 4 shorthands / 100 syllables (often fewer / sometimes none)
+- **ume**: dense replacements on even `image_id` pages; none on odd pages
+
+Only shorthands whose stacks are supported by the paired font (and not denylisted) are applied. Ground-truth transcriptions use the contracted text.
 
 The renderer groups pages by font into multi-page LuaLaTeX batches, then rasterizes with:
 
@@ -107,8 +145,8 @@ Every other exported page gets `༄༅། །` prepended before TeX rendering an
 ## 4. Validate
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/synthetic_benchmark/validate_output.py \
-  scripts/synthetic_benchmark/out/dataset
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/validate_output.py \
+  synthetic_benchmark/out/dataset
 ```
 
 This checks that every alignment row has its image file, samples image dimensions and image modes, and reports alignment parquet counts.

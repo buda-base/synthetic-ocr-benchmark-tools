@@ -15,20 +15,24 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 import pyarrow.parquet as pq
+from collections import defaultdict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[1]
-BENCHMARK_DIR = REPO_ROOT / "scripts" / "benchmark_gen"
-COVERAGE_DIR = REPO_ROOT / "scripts" / "coverage_report"
+REPO_ROOT = SCRIPT_DIR.parent
+BENCHMARK_DIR = REPO_ROOT / "benchmark_gen"
+COVERAGE_DIR = REPO_ROOT / "coverage_report"
 
 DEFAULT_BENCHMARK_CSV = BENCHMARK_DIR / "catalog" / "Benchmark catalog - digital_fonts.csv"
 DEFAULT_SCRIPTS_CSV = BENCHMARK_DIR / "catalog" / "Script lists - Scripts.csv"
 DEFAULT_FONTS_CSV = BENCHMARK_DIR / "digital_fonts.filtered.csv"
 DEFAULT_BOCORPUS_PARQUET = COVERAGE_DIR / ".cache" / "bocorpus" / "bo_corpus.parquet"
 DEFAULT_STACKS_CSV = COVERAGE_DIR / "bocorpus_stacks.csv"
+DEFAULT_SUPPORT_PARQUET = COVERAGE_DIR / "out" / "stack_support.parquet"
 DEFAULT_CHUNKS_PARQUET = SCRIPT_DIR / "out" / "bocorpus_chunks.parquet"
 DEFAULT_RENDER_PLAN = SCRIPT_DIR / "out" / "render_plan.parquet"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "out" / "dataset"
+DEFAULT_SHORTHANDS_CSV = SCRIPT_DIR / "data" / "shorthands" / "shorthands.csv"
+DEFAULT_SHORTHAND_DENYLIST = SCRIPT_DIR / "data" / "shorthands" / "denylist.csv"
 
 TIBETAN_START = 0x0F00
 TIBETAN_END = 0x0FFF
@@ -318,6 +322,24 @@ def load_font_catalog(
                 )
             )
     return rows
+
+
+def load_supported_stacks(path: Path) -> dict[str, set[str]]:
+    """Load font basename -> supported stack set from coverage support parquet."""
+    schema = pq.read_schema(path)
+    columns = ["test_kind", "basename", "stack", "ok"]
+    has_warning_count = "placement_warning_count" in schema.names
+    if has_warning_count:
+        columns.append("placement_warning_count")
+    table = pq.read_table(path, columns=columns)
+    supported: dict[str, set[str]] = defaultdict(set)
+    for row in table.to_pylist():
+        if row["test_kind"] != "stack" or not row["ok"]:
+            continue
+        if has_warning_count and (row.get("placement_warning_count") or 0) != 0:
+            continue
+        supported[row["basename"]].add(row["stack"])
+    return dict(supported)
 
 
 def tex_escape(text: str) -> str:

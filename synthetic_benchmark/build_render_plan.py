@@ -23,7 +23,9 @@ from synthetic_common import (
     DEFAULT_SCRIPTS_CSV,
     FontCatalogRow,
     load_font_catalog,
+    load_supported_stacks,
     stack_difficulty_score,
+    tokenize_tibetan_stacks,
 )
 
 GROUP_SIZE = 1000
@@ -44,6 +46,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--batch-size", type=int, default=5000)
     parser.add_argument("--max-chunk-reuse-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--oversample-ume-dense",
+        action="store_true",
+        help=(
+            "For ume even image_id rows, concatenate one extra coverage-compatible chunk "
+            "(~2x source text) so dense shorthand contraction still fills a pecha page."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -64,23 +74,6 @@ def normalized_script(value: str) -> str:
 
 def font_name(font: FontCatalogRow) -> str:
     return font.ps_name or font.basename or font.font_file
-
-
-def load_supported_stacks(path: Path) -> dict[str, set[str]]:
-    schema = pq.read_schema(path)
-    columns = ["test_kind", "basename", "stack", "ok"]
-    has_warning_count = "placement_warning_count" in schema.names
-    if has_warning_count:
-        columns.append("placement_warning_count")
-    table = pq.read_table(path, columns=columns)
-    supported: dict[str, set[str]] = defaultdict(set)
-    for row in table.to_pylist():
-        if row["test_kind"] != "stack" or not row["ok"]:
-            continue
-        if has_warning_count and (row.get("placement_warning_count") or 0) != 0:
-            continue
-        supported[row["basename"]].add(row["stack"])
-    return dict(supported)
 
 
 def load_chunks(path: Path) -> list[dict[str, object]]:
@@ -231,6 +224,7 @@ def make_plan_rows(
     target_images: int,
     seed: int,
     max_chunk_reuse_ratio: float,
+    oversample_ume_dense: bool = False,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
     eligible_fonts = [
@@ -376,7 +370,79 @@ def make_plan_rows(
         row["image_id"] = next_image_id
         next_image_id += 1
         previous_script = script
+
+    if oversample_ume_dense:
+        oversample_ume_dense_rows(
+            rows,
+            chunks=chunks,
+            supported=supported,
+            fonts={font.basename: font for font in eligible_fonts},
+            used_font_chunks=used_font_chunks,
+        )
     return rows
+
+
+def oversample_ume_dense_rows(
+    rows: list[dict[str, object]],
+    *,
+    chunks: list[dict[str, object]],
+    supported: dict[str, set[str]],
+    fonts: dict[str, FontCatalogRow],
+    used_font_chunks: set[tuple[str, str]],
+) -> None:
+    """Append ~1 extra compatible chunk to ume even-image rows for dense shorthand fill."""
+    # Prefer harder unused chunks first, then allow already-used ones as filler.
+    ordered = sorted(chunks, key=lambda row: float(row["stack_difficulty_score"]), reverse=True)
+    oversampled = 0
+    for row in rows:
+        if str(row.get("script") or "") != "ume":
+            continue
+        try:
+            image_id = int(row["image_id"])
+        except (TypeError, ValueError):
+            continue
+        if image_id % 2 != 0:
+            continue
+        basename = str(row["basename"])
+        font = fonts.get(basename)
+        if font is None:
+            continue
+        existing_ids = set(str(row.get("chunk_id") or "").split("|"))
+        extra = None
+        for allow_used in (False, True):
+            for chunk in ordered:
+                chunk_id = str(chunk["chunk_id"])
+                if chunk_id in existing_ids:
+                    continue
+                key = (basename, chunk_id)
+                if not allow_used and key in used_font_chunks:
+                    continue
+                if not font_supports_chunk(font, chunk, supported):
+                    continue
+                extra = chunk
+                used_font_chunks.add(key)
+                break
+            if extra is not None:
+                break
+        if extra is None:
+            continue
+        combined_text = f"{row['text']} {extra['text']}".strip()
+        stacks = tokenize_tibetan_stacks(combined_text)
+        unique_stacks = sorted(set(stacks))
+        row["text"] = combined_text
+        row["char_count"] = len(combined_text)
+        row["stack_count"] = len(stacks)
+        row["unique_stack_count"] = len(unique_stacks)
+        row["stacks"] = " ".join(unique_stacks)
+        row["stack_difficulty_score"] = stack_difficulty_score(combined_text)
+        row["chunk_id"] = f"{row['chunk_id']}|{extra['chunk_id']}"
+        row["etext_source"] = (
+            f"{row['etext_source']}|bocorpus:{extra['bocorpus_row']}:"
+            f"{extra['char_start']}:{extra['char_end']}"
+        )
+        row["ume_dense_oversampled"] = 1
+        oversampled += 1
+    print(f"Oversampled {oversampled} ume dense-shorthand plan row(s) with extra chunk text")
 
 
 def write_summary(rows: list[dict[str, object]], output: Path) -> None:
@@ -425,6 +491,7 @@ def main() -> None:
         target_images=args.target_images,
         seed=args.seed,
         max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
+        oversample_ume_dense=args.oversample_ume_dense,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)

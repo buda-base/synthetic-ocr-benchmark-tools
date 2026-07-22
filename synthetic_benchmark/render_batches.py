@@ -9,6 +9,7 @@ import glob
 import hashlib
 import json
 import math
+import random
 import re
 import shutil
 import subprocess
@@ -23,12 +24,22 @@ import pyarrow.parquet as pq
 from PIL import Image
 from tqdm import tqdm
 
+from shorthand_aug import (
+    DEFAULT_DENYLIST_CSV,
+    DEFAULT_SHORTHANDS_CSV,
+    apply_shorthands,
+    load_denylist,
+    load_shorthand_pairs,
+    mode_for_script,
+)
 from synthetic_common import (
     BENCHMARK_DIR,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RENDER_PLAN,
+    DEFAULT_SUPPORT_PARQUET,
     SHAD,
     TSHEG,
+    load_supported_stacks,
     tex_escape,
 )
 
@@ -62,6 +73,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-merge-passes", type=int, default=5)
     parser.add_argument("--page-prefix", default=PAGE_PREFIX)
     parser.add_argument("--no-page-prefix", action="store_true")
+    parser.add_argument(
+        "--enable-shorthands",
+        action="store_true",
+        help="Apply script-aware shorthand replacements before TeX (off by default until coverage review).",
+    )
+    parser.add_argument("--shorthands", type=Path, default=DEFAULT_SHORTHANDS_CSV)
+    parser.add_argument("--shorthand-denylist", type=Path, default=DEFAULT_DENYLIST_CSV)
+    parser.add_argument(
+        "--support-parquet",
+        type=Path,
+        default=DEFAULT_SUPPORT_PARQUET,
+        help="Coverage support parquet used to filter shorthand stacks by font.",
+    )
+    parser.add_argument("--shorthand-max-per-100", type=float, default=4.0)
+    parser.add_argument("--shorthand-seed", type=int, default=13)
     parser.add_argument("--lualatex", default="lualatex")
     parser.add_argument("--pdftoppm", default="pdftoppm")
     parser.add_argument("--force", action="store_true")
@@ -430,13 +456,16 @@ def content_pages(pages: list[dict[str, int]]) -> list[dict[str, int]]:
 def init_source_fields(row: dict[str, object]) -> dict[str, object]:
     if "_source_chunk_ids" in row:
         return row
-    row["_source_chunk_ids"] = [str(row["chunk_id"])]
+    chunk_ids = [part for part in str(row["chunk_id"]).split("|") if part]
+    etext = str(
+        row.get("etext_source")
+        or f"bocorpus:{row['bocorpus_row']}:{row['char_start']}:{row['char_end']}"
+    )
+    row["_source_chunk_ids"] = chunk_ids or [str(row["chunk_id"])]
     row["_source_plan_image_ids"] = [str(row["image_id"])]
     row["_source_bocorpus_rows"] = [str(row["bocorpus_row"])]
     row["_source_char_ranges"] = [f"{row['char_start']}-{row['char_end']}"]
-    row["_source_etext_sources"] = [
-        str(row.get("etext_source") or f"bocorpus:{row['bocorpus_row']}:{row['char_start']}:{row['char_end']}")
-    ]
+    row["_source_etext_sources"] = [part for part in etext.split("|") if part] or [etext]
     return row
 
 
@@ -449,6 +478,9 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
     first["unique_stack_count"] = max(
         int(first.get("unique_stack_count") or 0),
         int(second.get("unique_stack_count") or 0),
+    )
+    first["shorthand_count"] = int(first.get("shorthand_count") or 0) + int(
+        second.get("shorthand_count") or 0
     )
     first["_source_chunk_ids"].extend(second["_source_chunk_ids"])
     first["_source_plan_image_ids"].extend(second["_source_plan_image_ids"])
@@ -531,6 +563,56 @@ def add_prefix_to_alternating_pages(
         else:
             item["text"] = text
             item["page_prefix_added"] = 0
+        prepared.append(item)
+    return prepared
+
+
+def apply_shorthands_to_rows(
+    rows: list[dict[str, object]],
+    *,
+    enabled: bool,
+    pairs,
+    denylist,
+    supported_by_font: dict[str, set[str]] | None,
+    max_per_100: float,
+    seed: int,
+) -> list[dict[str, object]]:
+    if not enabled:
+        prepared = []
+        for row in rows:
+            item = dict(row)
+            item.setdefault("shorthand_count", 0)
+            item.setdefault("shorthand_mode", "none")
+            prepared.append(item)
+        return prepared
+
+    prepared = []
+    for row in rows:
+        item = dict(row)
+        try:
+            image_id = int(item.get("image_id") or 0)
+        except (TypeError, ValueError):
+            image_id = 0
+        script = str(item.get("script") or "")
+        mode = mode_for_script(script, image_id)
+        basename = str(item.get("basename") or "")
+        supported = None
+        if supported_by_font is not None:
+            supported = supported_by_font.get(basename, set())
+        rng = random.Random(seed + image_id)
+        new_text, count = apply_shorthands(
+            str(item.get("text") or ""),
+            pairs,
+            mode=mode,
+            supported_stacks=supported,
+            denylist=denylist,
+            basename=basename,
+            rng=rng,
+            max_per_100_syllables=max_per_100,
+        )
+        item["text"] = new_text
+        item["shorthand_count"] = count
+        item["shorthand_mode"] = mode
         prepared.append(item)
     return prepared
 
@@ -619,6 +701,8 @@ def write_text_and_catalog(
                 "first_page_line_count": first_page_line_count,
                 "stack_count": row["stack_count"],
                 "unique_stack_count": row["unique_stack_count"],
+                "shorthand_count": row.get("shorthand_count", 0),
+                "shorthand_mode": row.get("shorthand_mode") or "none",
             }
         )
     return next_output_id
@@ -714,6 +798,15 @@ def render_batch(
     prefix = batch_dir / batch_id
 
     render_rows = prepare_rows(rows)
+    render_rows = apply_shorthands_to_rows(
+        render_rows,
+        enabled=bool(getattr(args, "enable_shorthands", False)),
+        pairs=getattr(args, "_shorthand_pairs", []),
+        denylist=getattr(args, "_shorthand_denylist", []),
+        supported_by_font=getattr(args, "_supported_stacks", None),
+        max_per_100=float(getattr(args, "shorthand_max_per_100", 4.0)),
+        seed=int(getattr(args, "shorthand_seed", 13)),
+    )
     compile_result = None
     pages_by_chunk: dict[str, list[dict[str, int]]] = {}
     lines_by_chunk_page: dict[tuple[str, int], list[list[int]]] = {}
@@ -1257,9 +1350,34 @@ def render_batches_parallel(
     return new_catalog_rows, ok_batches
 
 
+def load_shorthand_runtime(args: argparse.Namespace) -> None:
+    """Attach lexicon / denylist / support maps used by render workers."""
+    args._shorthand_pairs = []
+    args._shorthand_denylist = []
+    args._supported_stacks = None
+    if not args.enable_shorthands:
+        return
+    if not args.shorthands.is_file():
+        raise SystemExit(f"Missing shorthand lexicon: {args.shorthands}")
+    if not args.support_parquet.is_file():
+        raise SystemExit(
+            f"Missing support parquet for shorthand filtering: {args.support_parquet}\n"
+            "Rebuild coverage with shorthand stacks, then pass --support-parquet."
+        )
+    args._shorthand_pairs = load_shorthand_pairs(args.shorthands)
+    args._shorthand_denylist = load_denylist(args.shorthand_denylist)
+    args._supported_stacks = load_supported_stacks(args.support_parquet)
+    print(
+        f"Shorthands enabled: {len(args._shorthand_pairs)} pair(s), "
+        f"{len(args._shorthand_denylist)} denylist row(s), "
+        f"{len(args._supported_stacks)} font support map(s)"
+    )
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    load_shorthand_runtime(args)
     if args.force:
         checkpoint_dir = catalog_fragments_dir(args.out_dir)
         if checkpoint_dir.exists():

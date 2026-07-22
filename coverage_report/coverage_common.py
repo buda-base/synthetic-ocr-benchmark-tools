@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -21,16 +22,21 @@ from fontTools.ttLib import TTCollection, TTFont
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[1]
-BENCHMARK_DIR = REPO_ROOT / "scripts" / "benchmark_gen"
+REPO_ROOT = SCRIPT_DIR.parent
+BENCHMARK_DIR = REPO_ROOT / "benchmark_gen"
 DEFAULT_FONTS_CSV = BENCHMARK_DIR / "digital_fonts.filtered.csv"
 DEFAULT_OUT_DIR = SCRIPT_DIR / "out"
 # BoCorpus stack frequencies; produce with get_stacks_from_corpus.py
 DEFAULT_STACKS_CSV = SCRIPT_DIR / "bocorpus_stacks.csv"
+DEFAULT_SHORTHAND_STACKS_CSV = SCRIPT_DIR / "shorthand_stacks.csv"
 
 TIBETAN_START = 0x0F00
 TIBETAN_END = 0x0FFF
 DOTTED_CIRCLE = "\u25cc"
+TSA_PHRU = "\u0f39"
+# Relative-x shift (vs the same stack without tsa-phru) that means U+0F39
+# disturbed another mark's placement. Tuned on shorthand-pass review.
+TSA_PHRU_MARK_SHIFT_THRESHOLD = 0.30
 
 TIBETAN_BASE_LETTER_RANGES = ((0x0F40, 0x0F6C),)
 TIBETAN_SUBJOINED_RANGES = ((0x0F90, 0x0FBC),)
@@ -156,6 +162,8 @@ class StackProbe:
     stack: str
     is_standard_tibetan: int = 1
     nb_occurrences: int = 0
+    probe_source: str = "corpus"
+    force_shape: bool = False
 
 
 def parse_int(value: object, default: int = 0) -> int:
@@ -306,11 +314,19 @@ def _read_stacks_from_csv(path: Path, *, limit: int | None = None) -> list[Stack
                 continue
             seen.add(stack)
             standard_raw = (row.get("hunspell_bo") or "1").strip()
+            probe_source = (row.get("probe_source") or "corpus").strip() or "corpus"
+            force_shape = probe_source == "shorthand" or (row.get("force_shape") or "").strip() in {
+                "1",
+                "true",
+                "True",
+            }
             stacks.append(
                 StackProbe(
                     stack=stack,
                     is_standard_tibetan=1 if standard_raw == "1" else 0,
                     nb_occurrences=parse_int(row.get("nb_occurences"), 0),
+                    probe_source=probe_source,
+                    force_shape=force_shape,
                 )
             )
             if limit is not None and len(stacks) >= limit:
@@ -393,7 +409,7 @@ def contains_tibetan(text: str) -> bool:
 def normalize_stack_probe(probe: str | StackProbe) -> StackProbe:
     if isinstance(probe, StackProbe):
         return probe
-    return StackProbe(stack=probe, is_standard_tibetan=1)
+    return StackProbe(stack=probe, is_standard_tibetan=1, probe_source="corpus", force_shape=False)
 
 
 def font_file_sha256(path: Path) -> str:
@@ -413,7 +429,8 @@ class HarfbuzzShaper:
         hb.ot_font_set_funcs(self.font)
         self.upem = self.face.upem
 
-    def shape(self, text: str) -> dict[str, object]:
+    def _shape_geometry(self, text: str) -> dict[str, object]:
+        """Shape ``text`` to glyph boxes/metrics without placement policy checks."""
         buf = hb.Buffer()
         buf.add_str(text)
         if contains_tibetan(text):
@@ -427,23 +444,15 @@ class HarfbuzzShaper:
             hb.shape(self.font, buf, {})
         except Exception as exc:  # HarfBuzz errors are rare but worth preserving.
             return {
-                "ok": False,
-                "support_class": "shape_error",
-                "reason": f"shape_error:{type(exc).__name__}:{exc}",
-                "notdef_count": 0,
-                "has_dotted_circle": False,
-                "glyph_count": 0,
-                "cluster_count": 0,
-                "glyph_ids": "",
-                "glyph_names": "",
-                "clusters": "",
-                "advances": "",
-                "offsets": "",
+                "shape_error": f"shape_error:{type(exc).__name__}:{exc}",
+                "glyph_ids": [],
+                "glyph_names": [],
+                "clusters": [],
+                "advances": [],
+                "offsets": [],
+                "glyph_boxes": [],
                 "bbox": "",
                 "ink_area": 0,
-                "glyph_boxes": "",
-                "placement_warnings": "",
-                "placement_warning_count": 0,
             }
 
         infos = list(buf.glyph_infos)
@@ -454,7 +463,7 @@ class HarfbuzzShaper:
         advances: list[str] = []
         offsets: list[str] = []
         extents = []
-        glyph_boxes = []
+        glyph_boxes: list[dict[str, object]] = []
         ink_area = 0
 
         x_cursor = 0
@@ -494,13 +503,58 @@ class HarfbuzzShaper:
             x_cursor += pos.x_advance
             y_cursor += pos.y_advance
 
-        notdef_count = sum(1 for gid, name in zip(glyph_ids, glyph_names) if gid == 0 or name == ".notdef")
-        has_dotted_circle = any("dotted" in name.lower() or "25cc" in name.lower() for name in glyph_names)
-        cluster_count = len(set(clusters))
         bbox = ""
         if extents:
             xs0, ys0, xs1, ys1 = zip(*extents)
             bbox = f"{min(xs0)},{min(ys0)},{max(xs1)},{max(ys1)}"
+
+        return {
+            "shape_error": "",
+            "glyph_ids": glyph_ids,
+            "glyph_names": glyph_names,
+            "clusters": clusters,
+            "advances": advances,
+            "offsets": offsets,
+            "glyph_boxes": glyph_boxes,
+            "bbox": bbox,
+            "ink_area": int(ink_area),
+        }
+
+    def shape(self, text: str) -> dict[str, object]:
+        geo = self._shape_geometry(text)
+        if geo["shape_error"]:
+            return {
+                "ok": False,
+                "support_class": "shape_error",
+                "reason": str(geo["shape_error"]),
+                "notdef_count": 0,
+                "has_dotted_circle": False,
+                "glyph_count": 0,
+                "cluster_count": 0,
+                "glyph_ids": "",
+                "glyph_names": "",
+                "clusters": "",
+                "advances": "",
+                "offsets": "",
+                "bbox": "",
+                "ink_area": 0,
+                "glyph_boxes": "",
+                "placement_warnings": "",
+                "placement_warning_count": 0,
+            }
+
+        glyph_ids = list(geo["glyph_ids"])
+        glyph_names = list(geo["glyph_names"])
+        clusters = list(geo["clusters"])
+        advances = list(geo["advances"])
+        offsets = list(geo["offsets"])
+        glyph_boxes = list(geo["glyph_boxes"])
+        ink_area = int(geo["ink_area"])
+        bbox = str(geo["bbox"])
+
+        notdef_count = sum(1 for gid, name in zip(glyph_ids, glyph_names) if gid == 0 or name == ".notdef")
+        has_dotted_circle = any("dotted" in name.lower() or "25cc" in name.lower() for name in glyph_names)
+        cluster_count = len(set(clusters))
 
         reasons = []
         if notdef_count:
@@ -511,7 +565,20 @@ class HarfbuzzShaper:
             reasons.append("empty_shape")
         if ink_area == 0 and glyph_ids:
             reasons.append("zero_ink")
+        # Hard fail before geometry: many fonts hide the dotted-circle fallback
+        # behind private glyph names, so name-based detection misses them.
+        if has_missing_base_letter(text):
+            reasons.append("missing_base_letter")
         placement_warnings = detect_placement_warnings(text, glyph_boxes)
+        # Tsa-phru must not shove other marks around: reshape without U+0F39 and
+        # compare relative placement of the remaining marks.
+        if TSA_PHRU in text:
+            text_without = text.replace(TSA_PHRU, "")
+            if text_without and any("\u0f00" <= ch <= "\u0fff" for ch in text_without):
+                geo_wo = self._shape_geometry(text_without)
+                boxes_wo = list(geo_wo["glyph_boxes"])
+                if boxes_wo and detect_tsa_phru_mark_shift(text, glyph_boxes, boxes_wo):
+                    placement_warnings.append("tsa_phru_mark_shift")
         reasons.extend(placement_warnings)
 
         ok = not reasons
@@ -534,6 +601,67 @@ class HarfbuzzShaper:
             "placement_warnings": ";".join(placement_warnings),
             "placement_warning_count": len(placement_warnings),
         }
+
+
+def has_missing_base_letter(text: str) -> bool:
+    """True when a stack has combining marks/subjoined letters but no base letter.
+
+    Motivating false positives from shorthand-pass review (2026-07-22):
+    - Kokonor / U+0F39 U+0F74 U+0F7C U+0F7E
+    - JMY-MLCRT1.0 / U+0F39 U+0F74 U+0F7C
+    - JMY-MLCTT1.0 / U+0F39 U+0F7A U+0F7E
+    - GONGBA-Tibet / U+0F39 U+0F74 U+0F7C
+
+    Shorthand lists often encode contractions as U+0F39 (tsa-phru) plus vowels,
+    with no consonant base. OpenType Tibetan shaping still treats U+0F39 as a
+    mark, so HarfBuzz/Uniscribe insert a dotted-circle base. That is inherent to
+    the layout model, not a font bug — but the dotted circle is unusable for OCR
+    training, so these stacks must fail coverage.
+    """
+    metrics = stack_metrics(text)
+    if int(metrics["base_count"]) > 0:
+        return False
+    return (
+        int(metrics["subjoined_count"]) > 0
+        or int(metrics["vowel_diacritic_count"]) > 0
+        or "\u0f39" in text
+    )
+
+
+def trailing_top_mark_char_count(text: str) -> int:
+    count = 0
+    for ch in reversed(text):
+        if ch in TOP_MARKS:
+            count += 1
+        else:
+            break
+    return count
+
+
+def trailing_top_mark_glyph_count(text: str, glyph_boxes: list[dict[str, object]]) -> int:
+    """How many trailing glyphs to ignore as top-mark clutter.
+
+    Top marks are often ligated into one glyph (e.g. i+anusvara). Counting
+    Unicode top-mark characters and subtracting that many glyphs can delete real
+    subscript layers. Keep enough body glyphs for base + visible subjoined
+    material.
+
+    Motivating false negatives from shorthand-pass review (2026-07-22):
+    - Ddc_uchen / s+ny+riM: U+0F72+U+0F7E ligature made char-count stripping
+      drop the subjoined ra, hiding subscript_containment
+    - Dundrupfont-Regular / r+ts+toM: same ligature issue hid subscript_overlap
+    """
+    n_chars = trailing_top_mark_char_count(text)
+    if n_chars == 0 or not glyph_boxes:
+        return 0
+    metrics = stack_metrics(text)
+    # Always keep at least one body glyph.
+    max_strip = max(0, len(glyph_boxes) - 1)
+    # When subjoined letters are present, keep at least two body glyphs so a
+    # base/ligature + subjoined layer remain available to geometry checks.
+    if int(metrics["subjoined_count"]) >= 1 and len(glyph_boxes) >= 3:
+        max_strip = min(max_strip, len(glyph_boxes) - 2)
+    return min(n_chars, max_strip)
 
 
 def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -> list[str]:
@@ -603,6 +731,13 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
                 or bottom_inside_previous
             ):
                 warnings.append("floating_bottom_vowel")
+        if detect_bottom_vowel_horizontal_misalignment(text, glyph_boxes):
+            warnings.append("bottom_vowel_horizontal_misalignment")
+
+    if detect_mid_stem(text, glyph_boxes):
+        warnings.append("mid_stem")
+    if detect_tsa_phru_too_low(text, glyph_boxes):
+        warnings.append("tsa_phru_too_low")
 
     if metrics["subjoined_count"] < 1 or len(glyph_boxes) < 2:
         return warnings
@@ -619,6 +754,300 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
         warnings.append("subscript_insufficient_descent")
 
     return warnings
+
+
+def _head_floor(base: dict[str, object]) -> float | None:
+    base_top = int(base["ytop"])
+    base_height = base_top - int(base["ybot"])
+    if base_height <= 0:
+        return None
+    return base_top - 0.05 * base_height
+
+
+def top_mark_boxes(glyph_boxes: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Glyph boxes that sit on or above the base head bar."""
+    if len(glyph_boxes) < 2:
+        return []
+    head_floor = _head_floor(glyph_boxes[0])
+    if head_floor is None:
+        return []
+    return [box for box in glyph_boxes[1:] if int(box["ybot"]) >= head_floor]
+
+
+def bottom_vowel_mark_boxes(glyph_boxes: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Glyph boxes that are not the base and not top-of-head marks.
+
+    Top marks (gigu, naro, anusvara, and some tsa-phru drawings) sit on or above
+    the head bar. Bottom vowels and other body-attached marks extend below it.
+    """
+    if len(glyph_boxes) < 2:
+        return []
+    head_floor = _head_floor(glyph_boxes[0])
+    if head_floor is None:
+        return []
+    return [box for box in glyph_boxes[1:] if int(box["ybot"]) < head_floor]
+
+
+def _box_rel_x(body: dict[str, object], box: dict[str, object]) -> float:
+    body_center = (int(body["x0"]) + int(body["x1"])) / 2
+    body_width = max(1, int(body["x1"]) - int(body["x0"]))
+    mark_center = (int(box["x0"]) + int(box["x1"])) / 2
+    return (mark_center - body_center) / body_width
+
+
+def _non_tsa_phru_top_marks(glyph_boxes: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Top-of-head marks excluding the tsa-phru glyph itself."""
+    tsa = find_tsa_phru_box(glyph_boxes)
+    out: list[dict[str, object]] = []
+    for box in top_mark_boxes(glyph_boxes):
+        if _is_tsa_phru_glyph_name(box.get("name")):
+            continue
+        if (
+            tsa is not None
+            and int(box["gid"]) == int(tsa["gid"])
+            and int(box["x0"]) == int(tsa["x0"])
+            and int(box["ytop"]) == int(tsa["ytop"])
+        ):
+            continue
+        out.append(box)
+    return out
+
+
+def _mark_horizontal_displacement(body: dict[str, object], mark: dict[str, object]) -> float:
+    """How far a mark sits off the body: |rel_x| or left/right overhang, whichever is larger."""
+    rel = abs(_box_rel_x(body, mark))
+    body_x0 = int(body["x0"])
+    body_x1 = int(body["x1"])
+    body_width = max(1, body_x1 - body_x0)
+    mark_x0 = int(mark["x0"])
+    mark_x1 = int(mark["x1"])
+    left_hang = max(0, body_x0 - mark_x0) / body_width
+    right_hang = max(0, mark_x1 - body_x1) / body_width
+    return max(rel, left_hang, right_hang)
+
+
+def _max_top_mark_rel_x_shift(
+    boxes_with: list[dict[str, object]],
+    boxes_without: list[dict[str, object]],
+    n_top_marks: int,
+) -> float:
+    """Smallest achievable max |Δrel_x| when pairing top marks across shapes.
+
+    The with-tsa-phru shape often has one extra top glyph (the tsa-phru itself).
+    Try dropping extras so we compare the real shared top marks.
+
+    When the without-tsa-phru shape ligates the top mark into the body (no
+    separate top glyph), fall back to absolute displacement of the with-shape
+    top marks — they should still sit over the body.
+    """
+    if n_top_marks <= 0:
+        return 0.0
+    tops_with = top_mark_boxes(boxes_with)
+    tops_without = top_mark_boxes(boxes_without)
+    if not tops_without:
+        marks = _non_tsa_phru_top_marks(boxes_with)
+        if not marks:
+            return 0.0
+        body = boxes_with[0]
+        return max(_mark_horizontal_displacement(body, mark) for mark in marks)
+    if len(tops_with) < len(tops_without):
+        return 0.0
+
+    body_with = boxes_with[0]
+    body_without = boxes_without[0]
+    without_sorted = sorted(
+        tops_without, key=lambda box: (int(box["x0"]) + int(box["x1"])) / 2
+    )
+    target_n = len(without_sorted)
+    # Typical: exactly one extra top glyph (tsa-phru). Cap search size.
+    if len(tops_with) - target_n > 3:
+        return 0.0
+
+    best: float | None = None
+    for combo in itertools.combinations(range(len(tops_with)), target_n):
+        chosen = sorted(
+            (tops_with[i] for i in combo),
+            key=lambda box: (int(box["x0"]) + int(box["x1"])) / 2,
+        )
+        deltas = [
+            abs(_box_rel_x(body_with, a) - _box_rel_x(body_without, b))
+            for a, b in zip(chosen, without_sorted)
+        ]
+        score = max(deltas) if deltas else 0.0
+        if best is None or score < best:
+            best = score
+    return best or 0.0
+
+
+def _bottom_mark_rel_x_shift(
+    boxes_with: list[dict[str, object]],
+    boxes_without: list[dict[str, object]],
+) -> float:
+    lowers_with = bottom_vowel_mark_boxes(boxes_with)
+    if not lowers_with:
+        return 0.0
+    vowel_with = min(lowers_with, key=lambda box: int(box["ybot"]))
+    lowers_without = bottom_vowel_mark_boxes(boxes_without)
+    if lowers_without:
+        vowel_without = min(lowers_without, key=lambda box: int(box["ybot"]))
+        return abs(
+            _box_rel_x(boxes_with[0], vowel_with)
+            - _box_rel_x(boxes_without[0], vowel_without)
+        )
+    # Without tsa-phru the bottom vowel is often ligated into the body; it
+    # should sit under the body center. A large |rel_x| means tsa-phru shoved it.
+    return abs(_box_rel_x(boxes_with[0], vowel_with))
+
+
+def detect_tsa_phru_mark_shift(
+    text: str,
+    boxes_with: list[dict[str, object]],
+    boxes_without: list[dict[str, object]],
+) -> bool:
+    """True when U+0F39 changes placement of other marks vs the same stack without it.
+
+    Tsa-phru is a local mark on the base; it should not drag zhabs-kyu, dengbu,
+    naro, etc. sideways. Compare relative-x of shared marks in the with/without
+    shapes (dropping the extra tsa-phru top glyph when pairing).
+
+    Motivating false positives from shorthand-pass review (2026-07-22):
+    - AmdoClassic2 / rd^u+e (རྡེུ༹): zhabs-kyu and dengbu shift right only when
+      tsa-phru is present
+    - Amdo_classic_3 / n^o (ནོ༹): naro shifts far right when tsa-phru is present
+      (without-tsa-phru shape ligates na+o, so pairing needs the ligated fallback)
+    """
+    if TSA_PHRU not in text or len(boxes_with) < 2 or len(boxes_without) < 1:
+        return False
+    text_without = text.replace(TSA_PHRU, "")
+    n_top = sum(1 for ch in text_without if ch in TOP_MARKS)
+    top_shift = _max_top_mark_rel_x_shift(boxes_with, boxes_without, n_top)
+    bottom_shift = (
+        _bottom_mark_rel_x_shift(boxes_with, boxes_without)
+        if has_bottom_vowel(text)
+        else 0.0
+    )
+    return max(top_shift, bottom_shift) >= TSA_PHRU_MARK_SHIFT_THRESHOLD
+
+
+def _is_tsa_phru_glyph_name(name: object) -> bool:
+    n = str(name).lower()
+    return (
+        "0f39" in n
+        or "tsaphru" in n
+        or "tsa_phru" in n
+        or "tsa-phru" in n
+        or n.endswith("flag")
+        or ".flag" in n
+        or n == "flag"
+    )
+
+
+def find_tsa_phru_box(glyph_boxes: list[dict[str, object]]) -> dict[str, object] | None:
+    for box in glyph_boxes[1:]:
+        if _is_tsa_phru_glyph_name(box.get("name")):
+            return box
+    return None
+
+
+def detect_tsa_phru_too_low(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
+    """True when U+0F39 is drawn mid-stem instead of near the top-right of the letter.
+
+    Motivating false positive from shorthand-pass review (2026-07-22):
+    - Font / m^aM (མ༹ཾ): tsa-phru tick sits halfway down ma's right stem
+    """
+    if TSA_PHRU not in text or len(glyph_boxes) < 2:
+        return False
+    mark = find_tsa_phru_box(glyph_boxes)
+    if mark is None:
+        # Nameless fallback: a body-level mark with no subjoined/bottom-vowel
+        # reason to exist is almost always a fallen tsa-phru.
+        if has_bottom_vowel(text) or int(stack_metrics(text)["subjoined_count"]) > 0:
+            return False
+        body_marks = bottom_vowel_mark_boxes(glyph_boxes)
+        if not body_marks:
+            return False
+        mark = max(body_marks, key=lambda box: (int(box["ytop"]) + int(box["ybot"])) / 2)
+    base = glyph_boxes[0]
+    base_top = int(base["ytop"])
+    base_height = base_top - int(base["ybot"])
+    if base_height <= 0:
+        return False
+    mark_center = (int(mark["ytop"]) + int(mark["ybot"])) / 2
+    depth = (base_top - mark_center) / base_height
+    # Center more than ~25% down the stem ⇒ far below the head/top-right seat.
+    return depth > 0.25
+
+
+def detect_mid_stem(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
+    """True when the lowest body layer sits mid-stem while the base stem continues below.
+
+    Applies to zhabs-kyu / other bottom vowels and to any subjoined letter
+    (ya-tag, ra-tag, la-tag, wa-zur, stacked subjoineds, …). Only the lowest
+    body-attached glyph is checked: higher layers are supposed to sit above it.
+
+    Motivating false positives from shorthand-pass review (2026-07-22):
+    - Ddc_uchen / k^u+o (zhabs-kyu)
+    - Bhozuk_Gendun_Chompel / t^u+iM (zhabs-kyu)
+    - Himalaya_2 / d^u+o (zhabs-kyu)
+    - FZZWXBTOT_Uni / g^u+i (zhabs-kyu)
+    - BM-QZT / k^uM (zhabs-kyu)
+    - Bhozuk_Vijahara_A / t+yoM (ya-tag)
+    """
+    if len(glyph_boxes) < 2:
+        return False
+    metrics = stack_metrics(text)
+    if not has_bottom_vowel(text) and int(metrics["subjoined_count"]) < 1:
+        return False
+    base = glyph_boxes[0]
+    base_bottom = int(base["ybot"])
+    base_height = int(base["ytop"]) - base_bottom
+    if base_height <= 0:
+        return False
+    lowers = bottom_vowel_mark_boxes(glyph_boxes)
+    if not lowers:
+        return False
+    lowest = min(lowers, key=lambda box: int(box["ybot"]))
+    hang = int(lowest["ybot"]) - base_bottom
+    return hang > 0.12 * base_height
+
+
+def detect_bottom_vowel_horizontal_misalignment(
+    text: str, glyph_boxes: list[dict[str, object]]
+) -> bool:
+    """True when a bottom vowel is drawn mostly beside the base, not under it.
+
+    Some fonts (notably Kokonor) do not emit a separate ``dottedcircle`` glyph
+    when zhabs-kyu fails to attach after tsa-phru; they bake the dotted circle
+    into the ``_u`` outline and park that wide mark to the right of the stem.
+    Name-based dotted-circle detection misses those. Horizontal detachment of
+    the bottom-vowel ink catches them.
+
+    Motivating false positive from shorthand-pass review (2026-07-22):
+    - Kokonor / d^u+o (དོུ༹): dotted circle + zhabs-kyu to the right of da
+    """
+    if not has_bottom_vowel(text) or len(glyph_boxes) < 2:
+        return False
+    base = glyph_boxes[0]
+    base_x0 = int(base["x0"])
+    base_x1 = int(base["x1"])
+    base_width = base_x1 - base_x0
+    if base_width <= 0:
+        return False
+    for vowel in bottom_vowel_mark_boxes(glyph_boxes):
+        vowel_x0 = int(vowel["x0"])
+        vowel_x1 = int(vowel["x1"])
+        vowel_width = vowel_x1 - vowel_x0
+        if vowel_width <= 0:
+            continue
+        overlap = min(base_x1, vowel_x1) - max(base_x0, vowel_x0)
+        outside_ratio = 1.0 - max(0, overlap) / vowel_width
+        center = (vowel_x0 + vowel_x1) / 2
+        center_outside = (
+            center < base_x0 - 0.10 * base_width or center > base_x1 + 0.10 * base_width
+        )
+        if outside_ratio >= 0.55 and center_outside:
+            return True
+    return False
 
 
 def detect_top_diacritic_collision(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
@@ -665,6 +1094,11 @@ def detect_top_diacritic_collision(text: str, glyph_boxes: list[dict[str, object
 
 
 def detect_top_mark_overlap(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
+    """Flag top marks colliding with / swallowed by the preceding body glyph.
+
+    Motivating false positive from shorthand-pass review (2026-07-22):
+    - AmdoClassic4 / tshuM (ཚུཾ): anusvara mostly inside the tsha+u composite
+    """
     top_mark_count = sum(1 for ch in text if ch in TOP_MARKS)
     if top_mark_count < 1 or text[-1:] not in TOP_MARKS or len(glyph_boxes) < 2:
         return False
@@ -685,7 +1119,10 @@ def detect_top_mark_overlap(text: str, glyph_boxes: list[dict[str, object]]) -> 
     # Top marks should sit above the preceding body/stack glyph. If a separate
     # top mark is mostly inside that preceding glyph's vertical span, it is
     # colliding with a top vowel/mark already present in the composite glyph.
-    if overlap_ratio >= 0.65 and last_bottom < previous_top:
+    #
+    # Threshold 0.60 (was 0.65). Motivating false positive from shorthand-pass
+    # review (2026-07-22): AmdoClassic4 / tshuM (ཚུཾ), overlap ratio ~0.645.
+    if overlap_ratio >= 0.60 and last_bottom < previous_top:
         return True
 
     for body in glyph_boxes[:-1]:
@@ -752,6 +1189,12 @@ def detect_mark_horizontal_misalignment(text: str, glyph_boxes: list[dict[str, o
 
 
 def detect_subscript_horizontal_misalignment(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
+    """Flag subscript layers drawn beside the stack instead of under it.
+
+    Motivating false positives from shorthand-pass review (2026-07-22):
+    - MiSansTibetan-Demibold / r+n+roM (རྣྲོཾ): subjoined layer shifted right and down
+    - GangJie-Uchen_1 / r+n+yaM (རྣྱཾ): subjoined layer laid out to the side
+    """
     metrics = stack_metrics(text)
     if int(metrics["subjoined_count"]) < 1 or len(glyph_boxes) < 2:
         return False
@@ -761,6 +1204,10 @@ def detect_subscript_horizontal_misalignment(text: str, glyph_boxes: list[dict[s
     # right while vertically overlapping it, the visual stack falls apart. Work
     # from glyph geometry because several fonts combine or split trailing marks
     # in ways that do not map one-to-one with Unicode codepoints.
+    #
+    # Also catch layers that have descended (as a subscript should) but with
+    # almost no horizontal overlap — those used to slip through when y-overlap
+    # was low because the component sat fully below the previous box.
     for previous, current in zip(glyph_boxes, glyph_boxes[1:]):
         previous_x0 = int(previous["x0"])
         previous_x1 = int(previous["x1"])
@@ -771,9 +1218,10 @@ def detect_subscript_horizontal_misalignment(text: str, glyph_boxes: list[dict[s
         current_top = int(current["ytop"])
         current_bottom = int(current["ybot"])
         previous_width = previous_x1 - previous_x0
+        previous_height = previous_top - previous_bottom
         current_width = current_x1 - current_x0
         current_height = current_top - current_bottom
-        if previous_width <= 0 or current_width <= 0 or current_height <= 0:
+        if previous_width <= 0 or previous_height <= 0 or current_width <= 0 or current_height <= 0:
             continue
         x_overlap = min(previous_x1, current_x1) - max(previous_x0, current_x0)
         x_overlap_ratio = max(0, x_overlap) / current_width
@@ -785,11 +1233,15 @@ def detect_subscript_horizontal_misalignment(text: str, glyph_boxes: list[dict[s
             or current_center > previous_x1 + 0.10 * previous_width
         )
         vertical_gap = current_top - previous_bottom
-        near_vertical_contact = 0 <= vertical_gap <= 0.08 * max(1, previous_top - previous_bottom)
+        near_vertical_contact = 0 <= vertical_gap <= 0.08 * previous_height
+        descended = (
+            current_bottom < previous_bottom - 0.05 * previous_height
+            or current_top < previous_top - 0.15 * previous_height
+        )
         if (
             x_overlap_ratio < 0.25
-            and (y_overlap_ratio >= 0.35 or near_vertical_contact)
             and center_outside
+            and (y_overlap_ratio >= 0.25 or near_vertical_contact or descended)
         ):
             return True
     return False
@@ -804,13 +1256,7 @@ def detect_subscript_layer_collision(
     if int(metrics["subjoined_count"]) < 4 or len(glyph_boxes) < 5:
         return False
 
-    trailing_top_marks = 0
-    for ch in reversed(text):
-        if ch in TOP_MARKS:
-            trailing_top_marks += 1
-        else:
-            break
-
+    trailing_top_marks = trailing_top_mark_glyph_count(text, glyph_boxes)
     end_idx = len(glyph_boxes) - trailing_top_marks
     # Drop the base glyph and any trailing top diacritic. What remains should
     # form descending visual layers in a valid tall stack.
@@ -834,13 +1280,7 @@ def detect_subscript_containment(text: str, glyph_boxes: list[dict[str, object]]
     if int(metrics["subjoined_count"]) < 2 or len(glyph_boxes) < 2:
         return False
 
-    trailing_top_marks = 0
-    for ch in reversed(text):
-        if ch in TOP_MARKS:
-            trailing_top_marks += 1
-        else:
-            break
-
+    trailing_top_marks = trailing_top_mark_glyph_count(text, glyph_boxes)
     end_idx = len(glyph_boxes) - trailing_top_marks
     stack_boxes = glyph_boxes[:end_idx]
     if len(stack_boxes) < 2:
@@ -883,13 +1323,7 @@ def detect_subscript_overlap(text: str, glyph_boxes: list[dict[str, object]]) ->
     if int(metrics["subjoined_count"]) < 2 or len(glyph_boxes) < 3:
         return False
 
-    trailing_top_marks = 0
-    for ch in reversed(text):
-        if ch in TOP_MARKS:
-            trailing_top_marks += 1
-        else:
-            break
-
+    trailing_top_marks = trailing_top_mark_glyph_count(text, glyph_boxes)
     end_idx = len(glyph_boxes) - trailing_top_marks
     stack_boxes = glyph_boxes[:end_idx]
     if len(stack_boxes) < 2:
@@ -920,13 +1354,7 @@ def detect_subscript_insufficient_descent(text: str, glyph_boxes: list[dict[str,
     if int(metrics["subjoined_count"]) < 2 or len(glyph_boxes) < 3:
         return False
 
-    trailing_top_marks = 0
-    for ch in reversed(text):
-        if ch in TOP_MARKS:
-            trailing_top_marks += 1
-        else:
-            break
-
+    trailing_top_marks = trailing_top_mark_glyph_count(text, glyph_boxes)
     end_idx = len(glyph_boxes) - trailing_top_marks
     stack_boxes = glyph_boxes[:end_idx]
     if len(stack_boxes) < 3:
@@ -966,7 +1394,9 @@ def shape_rows(
                     is_standard_tibetan=probe.is_standard_tibetan,
                     nb_occurrences=probe.nb_occurrences,
                 )
-                yield base_result_row(font_row, metrics, test_kind) | {
+                yield base_result_row(
+                    font_row, metrics, test_kind, probe_source=probe.probe_source
+                ) | {
                     "hb_version": hb_version,
                     "ok": False,
                     "support_class": "font_error",
@@ -998,8 +1428,9 @@ def shape_rows(
                 test_kind == "stack"
                 and font_row.skt_ok == 0
                 and probe.is_standard_tibetan == 0
+                and not probe.force_shape
             ):
-                yield base_result_row(font_row, metrics, test_kind) | {
+                yield base_result_row(font_row, metrics, test_kind, probe_source=probe.probe_source) | {
                     "hb_version": hb_version,
                     "ok": False,
                     "support_class": "non_standard_for_skt0",
@@ -1028,16 +1459,23 @@ def shape_rows(
                     "normal": "normal_tibetan_ok",
                     "latin": "latin_digit_punct_ok",
                 }.get(test_kind, "complex_stack_ok")
-            yield base_result_row(font_row, metrics, test_kind) | {
+            yield base_result_row(font_row, metrics, test_kind, probe_source=probe.probe_source) | {
                 "hb_version": hb_version,
                 **shaped,
                 "support_class": support_class,
             }
 
 
-def base_result_row(font_row: FontRow, metrics: dict[str, object], test_kind: str) -> dict[str, object]:
+def base_result_row(
+    font_row: FontRow,
+    metrics: dict[str, object],
+    test_kind: str,
+    *,
+    probe_source: str = "corpus",
+) -> dict[str, object]:
     return {
         "test_kind": test_kind,
+        "probe_source": probe_source,
         "basename": font_row.basename,
         "font_path": font_row.font_path_csv,
         "font_path_abs": str(font_row.font_path),

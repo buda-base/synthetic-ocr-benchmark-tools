@@ -11,10 +11,12 @@ from tqdm import tqdm
 from coverage_common import (
     DEFAULT_FONTS_CSV,
     DEFAULT_OUT_DIR,
+    DEFAULT_SHORTHAND_STACKS_CSV,
     DEFAULT_STACKS_CSV,
     LATIN_DIGIT_PUNCT_PROBES,
     NORMAL_TIBETAN_PROBES,
     ParquetRowWriter,
+    StackProbe,
     load_font_rows,
     read_probe_lines,
     read_stacks_path,
@@ -37,6 +39,28 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Stack probes: one NFD stack per line, or bocorpus_stacks.csv from "
             f"get_stacks_from_corpus.py. Default for --mode stacks/both: {DEFAULT_STACKS_CSV}"
+        ),
+    )
+    parser.add_argument(
+        "--shorthand-stacks",
+        type=Path,
+        default=DEFAULT_SHORTHAND_STACKS_CSV,
+        help=(
+            "Optional shorthand stack CSV (probe_source=shorthand). Merged into stack probes "
+            f"when present. Default: {DEFAULT_SHORTHAND_STACKS_CSV}"
+        ),
+    )
+    parser.add_argument(
+        "--no-shorthand-stacks",
+        action="store_true",
+        help="Do not merge shorthand_stacks.csv into the stack probe set.",
+    )
+    parser.add_argument(
+        "--shorthand-only",
+        action="store_true",
+        help=(
+            "Probe only shorthand stacks: equivalent to "
+            f"--mode stacks --stacks {DEFAULT_SHORTHAND_STACKS_CSV} --no-shorthand-stacks."
         ),
     )
     parser.add_argument(
@@ -67,8 +91,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def merge_stack_probes(
+    corpus_probes: list[StackProbe],
+    shorthand_probes: list[StackProbe],
+    *,
+    limit: int | None,
+) -> list[StackProbe]:
+    merged: list[StackProbe] = []
+    seen: set[str] = set()
+    # Prefer shorthand metadata when the same stack appears in both lists.
+    for probe in shorthand_probes + corpus_probes:
+        if probe.stack in seen:
+            continue
+        seen.add(probe.stack)
+        merged.append(probe)
+        if limit is not None and len(merged) >= limit:
+            break
+    return merged
+
+
 def main() -> None:
     args = parse_args()
+    if args.shorthand_only:
+        args.mode = "stacks"
+        args.stacks = args.shorthand_stacks
+        args.no_shorthand_stacks = True
+        if args.output is None:
+            args.output = args.out_dir / "shorthand_support.parquet"
     if args.mode in {"stacks", "both"}:
         stacks_path = args.stacks if args.stacks is not None else DEFAULT_STACKS_CSV
         if not stacks_path.is_file():
@@ -93,7 +142,7 @@ def main() -> None:
     summary_csv = args.summary_csv or output.with_suffix(".summary.csv")
     matrix_csv = args.matrix_csv or output.with_suffix(".matrix.csv")
 
-    jobs: list[tuple[str, list[str]]] = []
+    jobs: list[tuple[str, list]] = []
     if args.mode in {"normal", "both"}:
         normal = (
             read_probe_lines(args.normal_probes, limit=args.limit_stacks)
@@ -105,9 +154,24 @@ def main() -> None:
         jobs.append(("latin", LATIN_DIGIT_PUNCT_PROBES[: args.limit_stacks]))
     if args.mode in {"stacks", "both"}:
         assert stacks_path is not None
-        jobs.append(
-            ("stack", read_stacks_path(stacks_path, limit=args.limit_stacks))
+        corpus_probes = read_stacks_path(stacks_path, limit=None)
+        shorthand_probes: list[StackProbe] = []
+        if not args.no_shorthand_stacks and args.shorthand_stacks.is_file():
+            shorthand_probes = read_stacks_path(args.shorthand_stacks, limit=None)
+            print(
+                f"Merging {len(shorthand_probes)} shorthand stack probe(s) from {args.shorthand_stacks}"
+            )
+        elif not args.no_shorthand_stacks:
+            print(
+                f"NOTE: shorthand stacks not found at {args.shorthand_stacks}; "
+                "run export_shorthand_stacks.py to include them."
+            )
+        probes = merge_stack_probes(
+            corpus_probes,
+            shorthand_probes,
+            limit=args.limit_stacks,
         )
+        jobs.append(("stack", probes))
 
     with ParquetRowWriter(output, batch_size=args.batch_size) as writer:
         for test_kind, probes in jobs:

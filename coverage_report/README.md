@@ -5,7 +5,7 @@ Tools for measuring which Tibetan font faces can render ordinary Tibetan and com
 Run with the project venv:
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/coverage_report/build_support_dataset.py --help
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py --help
 ```
 
 ## Main Outputs
@@ -15,18 +15,51 @@ Run with the project venv:
 - `stack_support.matrix.csv`: one row per stack and one column per font, with `1` for supported and `0` for unsupported.
 - `font_features.parquet`: static `cmap`, `GSUB`, and `GPOS` evidence per font face.
 - `audit/`: rendered PNG samples, a manifest, and a contact sheet for manual false-positive/false-negative review.
+- `shorthand_audit/`: full-form shorthand contact sheets for review before enabling render-time injection.
 
-The default `bocorpus_stacks.csv` path is `scripts/coverage_report/`. Parquet and font evidence still default to `scripts/coverage_report/out/`.
+The default `bocorpus_stacks.csv` path is `coverage_report/`. Parquet and font evidence default to `coverage_report/out/`.
 
 ## Build Dynamic Support Data
 
-Default stack probes come from BoCorpus-derived frequencies: run `get_stacks_from_corpus.py` once to write `scripts/coverage_report/bocorpus_stacks.csv` (columns `stack`, `nb_occurences`, and `hunspell_bo`: the latter is 1 if the stack appears when segmenting at least one syllable form allowed by [hunspell-bo](https://github.com/eroux/hunspell-bo/) `bo.aff`/`bo.dic`, using the same botok normalization and stack tokenization as the corpus pass; see `hunspell_bo_stacks.py`). Then `build_support_dataset.py` uses that path by default for `--mode stacks` or `--mode both`.
+Default stack probes come from BoCorpus-derived frequencies: run `get_stacks_from_corpus.py` once to write `coverage_report/bocorpus_stacks.csv` (columns `stack`, `nb_occurences`, and `hunspell_bo`: the latter is 1 if the stack appears when segmenting at least one syllable form allowed by [hunspell-bo](https://github.com/eroux/hunspell-bo/) `bo.aff`/`bo.dic`, using the same botok normalization and stack tokenization as the corpus pass; see `hunspell_bo_stacks.py`). Then `build_support_dataset.py` uses that path by default for `--mode stacks` or `--mode both`.
+
+When present, `shorthand_stacks.csv` is merged into the stack probe set. Shorthand probes are always shaped with HarfBuzz (even for `skt_ok=0` fonts) and tagged `probe_source=shorthand` in the parquet.
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_shorthand_lexicon.py
+/home/eroux/pvenvs/1/bin/python coverage_report/export_shorthand_stacks.py
+/home/eroux/pvenvs/1/bin/python coverage_report/get_stacks_from_corpus.py
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py --mode both
+```
+
+### Shorthand-only coverage
+
+To shape/test only shorthand stacks (skip BoCorpus stacks, normal, and latin probes):
+
+```bash
+/home/eroux/pvenvs/1/bin/python coverage_report/export_shorthand_stacks.py
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py \
+  --shorthand-only \
+  --output coverage_report/out/shorthand_support.parquet
+```
+
+Equivalent explicit form:
+
+```bash
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py \
+  --mode stacks \
+  --stacks coverage_report/shorthand_stacks.csv \
+  --no-shorthand-stacks \
+  --output coverage_report/out/shorthand_support.parquet
+```
+
+Useful smoke options: `--limit-fonts N`, `--limit-stacks N`, `--font SomeBasename`.
 
 The stack file is treated as already normalized in NFD. The loader preserves that text and only skips obvious metadata/non-Tibetan lines. For `.csv` output from `get_stacks_from_corpus.py`, the `stack` column is read (see `read_stacks_path` in `coverage_common.py`).
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/coverage_report/get_stacks_from_corpus.py
-/home/eroux/pvenvs/1/bin/python scripts/coverage_report/build_support_dataset.py --mode both
+/home/eroux/pvenvs/1/bin/python coverage_report/get_stacks_from_corpus.py
+/home/eroux/pvenvs/1/bin/python coverage_report/build_support_dataset.py --mode both
 ```
 
 `--mode both` runs ordinary Tibetan probes, Latin digit/punctuation probes, and BoCorpus stack probes. Use `--mode latin` when you only want to check ASCII digits and parentheses. The Latin probe set includes each character individually plus `0123456789` and `(0123456789)`.
@@ -104,8 +137,8 @@ Important columns:
 Use audit sheets to look for false positives and false negatives. This is expected to take a few rounds.
 
 ```bash
-/home/eroux/pvenvs/1/bin/python scripts/coverage_report/render_audit_sheet.py \
-  scripts/coverage_report/out/stack_support.parquet \
+/home/eroux/pvenvs/1/bin/python coverage_report/render_audit_sheet.py \
+  coverage_report/out/stack_support.parquet \
   --kind complex-pass \
   --sample-size 80
 ```
@@ -122,7 +155,28 @@ Audit kinds:
 - `false-negative`: automated failures in fonts already marked `skt_ok=1`.
 - `normal-fail`: ordinary Tibetan probes that failed, useful for checking whether `skt_ok=0` fonts are still safe for normal text.
 - `disagreement`: stack rows where the automated result disagrees with the existing broad `skt_ok` flag.
+- `shorthand-pass` / `shorthand-fail`: stack probes tagged `probe_source=shorthand`.
 - `mixed`: any sampled rows.
+
+### Shorthand stack review (recommended gate)
+
+Before enabling `--enable-shorthands` in render, review auto-ok shorthand stacks:
+
+```bash
+/home/eroux/pvenvs/1/bin/python coverage_report/render_shorthand_audit.py \
+  coverage_report/out/shorthand_support.parquet \
+  --kind shorthand-pass \
+  --sample-size 80
+```
+
+This is a **per-stack** review (not full shorthand phrases). Each cell renders one shorthand stack; the label shows that stack’s **EWTS** via `pyewts` (so repeated vowels/marks stay readable when a font merges them visually). The manifest keeps `stack`, `stack_ewts`, and `codepoints`.
+
+Inspect `coverage_report/out/shorthand_audit/contact_sheet.jpg`. Bad positives can become:
+
+- new placement heuristics in `coverage_common.py`, and/or
+- rows in `synthetic_benchmark/data/shorthands/denylist.csv` (`basename`, `shorthand`, `stack`, `reason`)
+
+Rebuild support / re-audit until sampled positives look reliable, then enable shorthand injection.
 
 Review the contact sheet and update heuristics or manual override data in a later round. Keep raw Parquet rows stable where possible so derived summaries can be regenerated and compared.
 
@@ -135,12 +189,19 @@ Hard failures:
 - dotted-circle glyph
 - empty shape
 - zero ink for a non-empty glyph sequence
+- **missing base letter**: combining marks / subjoined letters with no Tibetan base consonant (`missing_base_letter`). Often U+0F39 (tsa-phru) plus vowels from shorthand lists: OpenType still treats U+0F39 as a mark, so the layout engine inserts a dotted-circle base. Motivating review cases: Kokonor `U+0F39 U+0F74 U+0F7C U+0F7E`; JMY-MLCRT1.0 `U+0F39 U+0F74 U+0F7C`; JMY-MLCTT1.0 `U+0F39 U+0F7A U+0F7E`; GONGBA-Tibet `U+0F39 U+0F74 U+0F7C`
+- **top mark overlap** threshold 0.60. Motivating review case: AmdoClassic4 `tshuM`
+- Trailing top-mark glyph stripping accounts for ligated marks (i+M as one glyph). Motivating review cases: Ddc_uchen `s+ny+riM`; Dundrupfont-Regular `r+ts+toM`
 - floating bottom-vowel geometry in tall stacks
+- **mid-stem** (`mid_stem`): the lowest body-attached layer (zhabs-kyu / any subjoined: ya-tag, ra-tag, la-tag, …) sits partway down the base stem while the stem continues below it. Motivating review cases: Ddc_uchen `k^u+o`; Bhozuk_Gendun_Chompel `t^u+iM`; Himalaya_2 `d^u+o`; FZZWXBTOT_Uni `g^u+i`; Bhozuk_Vijahara_A `t+yoM`
+- **bottom vowel horizontal misalignment** (`bottom_vowel_horizontal_misalignment`): zhabs-kyu (or another bottom vowel) is drawn mostly beside the base. Catches fonts that bake a dotted-circle fallback into the vowel glyph instead of emitting a separate `dottedcircle` name. Motivating review case: Kokonor `d^u+o`
+- **tsa-phru mark shift** (`tsa_phru_mark_shift`): reshape the same stack without U+0F39 and compare relative-x of the other marks; fail when tsa-phru shoves zhabs-kyu / dengbu / naro / etc. When the without-tsa-phru shape ligates the top mark into the body, fall back to absolute top-mark displacement over the base. Motivating review cases: AmdoClassic2 `rd^u+e`; Amdo_classic_3 `n^o`
+- **tsa-phru too low** (`tsa_phru_too_low`): U+0F39 center sits mid-stem instead of near the top-right of the letter. Motivating review case: Font `m^aM`
 - horizontal below-mark misalignment, where U+0F35 or U+0F37 is drawn too far outside the base stack's horizontal span
 - top mark overlap, where a top mark collides with a top vowel/mark already present in the preceding composite glyph
 - top mark horizontal misalignment, where a trailing top-mark cluster is drawn mostly to the side of the base stack
 - top diacritic collision, where repeated top marks are drawn with identical geometry
-- subscript horizontal misalignment, where a subscript layer is drawn mostly to the side instead of under the previous stack layer
+- subscript horizontal misalignment, where a subscript layer is drawn mostly to the side instead of under the previous stack layer (also when it has descended but stays horizontally detached). Motivating review cases: MiSansTibetan-Demibold `r+n+roM`; GangJie-Uchen_1 `r+n+yaM`
 - subscript containment, where the final subscript is drawn entirely inside the previous stack component instead of becoming a lower layer
 - subscript overlap, where adjacent subscript layers overlap too much to read as separate vertical layers
 - subscript insufficient descent, where the next subscript starts too high relative to the previous subscript layer
