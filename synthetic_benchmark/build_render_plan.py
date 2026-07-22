@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
+from shorthand_aug import mode_for_script
 from synthetic_common import (
     DEFAULT_BENCHMARK_CSV,
     DEFAULT_CHUNKS_PARQUET,
@@ -52,6 +53,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "For ume even image_id rows, concatenate one extra coverage-compatible chunk "
             "(~2x source text) so dense shorthand contraction still fills a pecha page."
+        ),
+    )
+    parser.add_argument(
+        "--images-per-font",
+        type=int,
+        default=None,
+        help=(
+            "If set, ignore --target-images quotas and allocate exactly this many images "
+            "per eligible font (useful for small with/without shorthand smoke runs)."
+        ),
+    )
+    parser.add_argument(
+        "--pair-shorthand-modes",
+        action="store_true",
+        help=(
+            "After planning, assign each font consecutive even/odd image_ids and pin "
+            "shorthand_mode: even=with (uchen sparse / ume dense), odd=none. "
+            "Intended for --images-per-font 2 smoke plans."
         ),
     )
     return parser.parse_args()
@@ -216,6 +235,198 @@ def next_chunk_for_font(
     return None
 
 
+def _plan_row_dict(
+    *,
+    image_id: int,
+    chunk: dict[str, object],
+    font: FontCatalogRow,
+    script: str,
+    split: str,
+) -> dict[str, object]:
+    return {
+        "image_id": image_id,
+        "chunk_id": chunk["chunk_id"],
+        "bocorpus_row": chunk["bocorpus_row"],
+        "char_start": chunk["char_start"],
+        "char_end": chunk["char_end"],
+        "text": chunk["text"],
+        "char_count": chunk["char_count"],
+        "stack_count": chunk["stack_count"],
+        "unique_stack_count": chunk["unique_stack_count"],
+        "stacks": chunk.get("stacks", ""),
+        "stack_difficulty_score": float(chunk["stack_difficulty_score"]),
+        "basename": font.basename,
+        "font_name": font_name(font),
+        "font_file": font.font_file,
+        "font_path": font.font_path,
+        "font_abs_path": str(font.font_abs_path),
+        "ps_name": font.ps_name,
+        "ttc_face_index": font.ttc_face_index,
+        "font_size_pt": font.font_size_pt,
+        "dpi": font.dpi,
+        "skt_ok": font.skt_ok,
+        "script_id": font.script_id,
+        "script_category": font.script_category,
+        "script_8": font.script_category,
+        "script_type": font.script_type,
+        "script": script,
+        "script_name": font.script_name,
+        "etext_source": (
+            f"bocorpus:{chunk['bocorpus_row']}:{chunk['char_start']}:{chunk['char_end']}"
+        ),
+        "suggested_split": split,
+        "ume_dense_oversampled": 0,
+        "shorthand_mode": "",
+    }
+
+
+def assign_paired_shorthand_modes(rows: list[dict[str, object]]) -> None:
+    """Pin even=with / odd=without shorthand_mode and reassign image_ids per font."""
+    by_font: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        by_font[str(row["basename"])].append(row)
+
+    next_id = 2  # start on even so the first "with" page is dense/sparse-eligible
+    for basename in sorted(by_font):
+        font_rows = by_font[basename]
+        for index, row in enumerate(font_rows):
+            script = str(row.get("script") or "")
+            if index % 2 == 0:
+                if next_id % 2 != 0:
+                    next_id += 1
+                row["image_id"] = next_id
+                row["shorthand_mode"] = mode_for_script(script, next_id)
+            else:
+                if next_id % 2 == 0:
+                    next_id += 1
+                row["image_id"] = next_id
+                row["shorthand_mode"] = "none"
+            next_id += 1
+
+
+def make_per_font_plan_rows(
+    *,
+    fonts: list[FontCatalogRow],
+    chunks: list[dict[str, object]],
+    supported: dict[str, set[str]],
+    images_per_font: int,
+    seed: int,
+    max_chunk_reuse_ratio: float,
+    oversample_ume_dense: bool = False,
+    pair_shorthand_modes: bool = False,
+) -> list[dict[str, object]]:
+    """Allocate exactly ``images_per_font`` coverage-compatible chunks per font."""
+    if images_per_font <= 0:
+        raise ValueError("--images-per-font must be positive")
+    rng = random.Random(seed)
+    eligible_fonts = [
+        font
+        for font in fonts
+        if font.basename in supported and font.script_category and normalized_script(font.script_type)
+    ]
+    split_by_font_name = assign_font_splits(eligible_fonts, supported, rng)
+    chunks = sorted(chunks, key=lambda row: float(row["stack_difficulty_score"]), reverse=True)
+
+    rows: list[dict[str, object]] = []
+    used_font_chunks: set[tuple[str, str]] = set()
+    chunk_split: dict[str, str] = {}
+    chunk_use_counts: Counter[str] = Counter()
+    reused_chunk_ids: set[str] = set()
+    cursors: dict[tuple[str, str, bool], int] = {}
+    target_images = len(eligible_fonts) * images_per_font
+    max_reused_chunks = int(target_images * max(0.0, max_chunk_reuse_ratio))
+    image_id = 1
+
+    ordered_fonts = list(eligible_fonts)
+    rng.shuffle(ordered_fonts)
+    short_fonts = 0
+    for font in tqdm(ordered_fonts, desc="Plan per font", unit="font"):
+        script = normalized_script(font.script_type)
+        split = split_by_font_name.get(font_name(font))
+        if not split:
+            continue
+        font_info = FontPlanInfo(font=font, split=split)
+        made = 0
+        for _ in range(images_per_font):
+            chunk = None
+            for allow_reuse in (False, True):
+                chunk = next_chunk_for_font(
+                    font_info,
+                    chunks,
+                    supported,
+                    used_font_chunks,
+                    chunk_split,
+                    chunk_use_counts,
+                    reused_chunk_ids,
+                    max_reused_chunks,
+                    cursors,
+                    allow_reuse=allow_reuse,
+                )
+                if chunk is not None:
+                    break
+            if chunk is None:
+                break
+            chunk_id = str(chunk["chunk_id"])
+            used_font_chunks.add((font.basename, chunk_id))
+            chunk_split.setdefault(chunk_id, split)
+            chunk_use_counts[chunk_id] += 1
+            if chunk_use_counts[chunk_id] > 1:
+                reused_chunk_ids.add(chunk_id)
+            rows.append(
+                _plan_row_dict(
+                    image_id=image_id,
+                    chunk=chunk,
+                    font=font,
+                    script=script,
+                    split=split,
+                )
+            )
+            image_id += 1
+            made += 1
+        if made < images_per_font:
+            short_fonts += 1
+            print(
+                f"WARNING: {font.basename} only got {made}/{images_per_font} image(s); "
+                "no more compatible chunks"
+            )
+    if short_fonts:
+        print(f"WARNING: {short_fonts} font(s) under-allocated")
+
+    if pair_shorthand_modes:
+        assign_paired_shorthand_modes(rows)
+    else:
+        rows.sort(
+            key=lambda row: (
+                str(row["script"]),
+                str(row["script_8"]),
+                str(row["suggested_split"]),
+                -float(row["stack_difficulty_score"]),
+                str(row["font_name"]),
+            )
+        )
+        next_image_id = 1
+        previous_script = ""
+        for row in rows:
+            script = str(row["script"])
+            if previous_script and script != previous_script:
+                page_offset = (next_image_id - 1) % GROUP_SIZE
+                if page_offset:
+                    next_image_id += GROUP_SIZE - page_offset
+            row["image_id"] = next_image_id
+            next_image_id += 1
+            previous_script = script
+
+    if oversample_ume_dense:
+        oversample_ume_dense_rows(
+            rows,
+            chunks=chunks,
+            supported=supported,
+            fonts={font.basename: font for font in eligible_fonts},
+            used_font_chunks=used_font_chunks,
+        )
+    return rows
+
+
 def make_plan_rows(
     *,
     fonts: list[FontCatalogRow],
@@ -304,37 +515,13 @@ def make_plan_rows(
                             if chunk_use_counts[chunk_id] > 1:
                                 reused_chunk_ids.add(chunk_id)
                             rows.append(
-                                {
-                                    "image_id": image_id,
-                                    "chunk_id": chunk["chunk_id"],
-                                    "bocorpus_row": chunk["bocorpus_row"],
-                                    "char_start": chunk["char_start"],
-                                    "char_end": chunk["char_end"],
-                                    "text": chunk["text"],
-                                    "char_count": chunk["char_count"],
-                                    "stack_count": chunk["stack_count"],
-                                    "unique_stack_count": chunk["unique_stack_count"],
-                                    "stacks": chunk.get("stacks", ""),
-                                    "stack_difficulty_score": float(chunk["stack_difficulty_score"]),
-                                    "basename": font.basename,
-                                    "font_name": font_name(font),
-                                    "font_file": font.font_file,
-                                    "font_path": font.font_path,
-                                    "font_abs_path": str(font.font_abs_path),
-                                    "ps_name": font.ps_name,
-                                    "ttc_face_index": font.ttc_face_index,
-                                    "font_size_pt": font.font_size_pt,
-                                    "dpi": font.dpi,
-                                    "skt_ok": font.skt_ok,
-                                    "script_id": font.script_id,
-                                    "script_category": font.script_category,
-                                    "script_8": font.script_category,
-                                    "script_type": font.script_type,
-                                    "script": script,
-                                    "script_name": font.script_name,
-                                    "etext_source": f"bocorpus:{chunk['bocorpus_row']}:{chunk['char_start']}:{chunk['char_end']}",
-                                    "suggested_split": split,
-                                }
+                                _plan_row_dict(
+                                    image_id=image_id,
+                                    chunk=chunk,
+                                    font=font,
+                                    script=script,
+                                    split=split,
+                                )
                             )
                             image_id += 1
                             remaining -= 1
@@ -397,11 +584,16 @@ def oversample_ume_dense_rows(
     for row in rows:
         if str(row.get("script") or "") != "ume":
             continue
+        mode = str(row.get("shorthand_mode") or "").strip().lower()
         try:
             image_id = int(row["image_id"])
         except (TypeError, ValueError):
             continue
-        if image_id % 2 != 0:
+        # Prefer explicit plan mode; otherwise even image_ids are dense pages.
+        if mode:
+            if mode != "dense":
+                continue
+        elif image_id % 2 != 0:
             continue
         basename = str(row["basename"])
         font = fonts.get(basename)
@@ -484,15 +676,29 @@ def main() -> None:
     if not chunks:
         raise SystemExit(f"No chunks found in {args.chunks}")
 
-    rows = make_plan_rows(
-        fonts=fonts,
-        chunks=chunks,
-        supported=supported,
-        target_images=args.target_images,
-        seed=args.seed,
-        max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
-        oversample_ume_dense=args.oversample_ume_dense,
-    )
+    if args.images_per_font is not None:
+        rows = make_per_font_plan_rows(
+            fonts=fonts,
+            chunks=chunks,
+            supported=supported,
+            images_per_font=args.images_per_font,
+            seed=args.seed,
+            max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
+            oversample_ume_dense=args.oversample_ume_dense,
+            pair_shorthand_modes=args.pair_shorthand_modes,
+        )
+    else:
+        if args.pair_shorthand_modes:
+            raise SystemExit("--pair-shorthand-modes requires --images-per-font")
+        rows = make_plan_rows(
+            fonts=fonts,
+            chunks=chunks,
+            supported=supported,
+            target_images=args.target_images,
+            seed=args.seed,
+            max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
+            oversample_ume_dense=args.oversample_ume_dense,
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, args.output, compression="zstd")

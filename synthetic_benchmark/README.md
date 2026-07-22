@@ -76,6 +76,18 @@ Reject bad cases via heuristics or `data/shorthands/denylist.csv`. Shorthand inj
 
 For dense ume shorthand pages (every other ume image), also pass `--oversample-ume-dense` so those plan rows start from ~2× source text before contraction.
 
+Small with/without smoke plan (~2 images per font; even=`with`, odd=`none`):
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/build_render_plan.py \
+  --chunks synthetic_benchmark/out/bocorpus_chunks.parquet \
+  --support-parquet coverage_report/out/stack_support.parquet \
+  --images-per-font 2 \
+  --pair-shorthand-modes \
+  --oversample-ume-dense \
+  --output synthetic_benchmark/out/render_plan_shorthand_smoke.parquet
+```
+
 The planner rejects a `(font, chunk)` candidate if any Tibetan stack in the whole chunk is unsupported by that font. Unknown stacks are treated as unsupported. It uses `ok=True` and, when present, `placement_warning_count=0`.
 
 ## 3. Render Pecha JPEG/Alignment Pairs

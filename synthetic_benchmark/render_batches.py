@@ -594,7 +594,10 @@ def apply_shorthands_to_rows(
         except (TypeError, ValueError):
             image_id = 0
         script = str(item.get("script") or "")
-        mode = mode_for_script(script, image_id)
+        # Plan may pin mode (e.g. smoke pairs: one with / one without per font).
+        mode = str(item.get("shorthand_mode") or "").strip().lower()
+        if mode not in {"sparse", "dense", "none"}:
+            mode = mode_for_script(script, image_id)
         basename = str(item.get("basename") or "")
         supported = None
         if supported_by_font is not None:
