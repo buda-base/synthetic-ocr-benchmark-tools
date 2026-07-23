@@ -126,35 +126,15 @@ Geometry / placement failures (bounding-box heuristics on the shaped glyphs):
 | `tsa_phru_mark_shift` | Reshape without U+0F39 and compare; fail when *tsa-phru* shoves other marks sideways |
 | `tsa_phru_too_low` | U+0F39 center sits mid-stem instead of near the top-right of the letter |
 | `mark_horizontal_misalignment` | U+0F35 / U+0F37 drift beside the base instead of under/over it |
-| `top_mark_overlap` | Trailing top mark collides with or is swallowed by the body |
+| `top_mark_overlap` | Trailing top mark collides with or is swallowed by the body (with a narrow exception for a single mark nesting into the inherent *tsa-phru* tick on ཙ / ཚ / ཛ when it still reaches the head) |
 | `top_mark_horizontal_misalignment` | Top mark cluster mostly detached left/right |
 | `top_diacritic_collision` | Repeated top marks share identical geometry |
+| `superscript_merge` | Separate *ra-go* mostly merged into the next letter’s head (except over ྩ / ྪ / ྫ, where nesting into the tick is normal) |
 | `subscript_horizontal_misalignment` | Next layer beside, not under, the previous one |
 | `subscript_containment` | “Subscript” drawn entirely inside the previous component |
 | `subscript_overlap` | Adjacent layers overlap too much to read as separate |
 | `subscript_insufficient_descent` | Next layer does not start lower |
 | `subscript_layer_collision` | ≥4 subscripts jammed into the same vertical band |
-
-The newer rules (`mid_stem`, `tsa_phru_*`, `bottom_vowel_horizontal_misalignment`, `missing_base_letter`, `superscript_merge`) came out of visual review (including shorthand-pass audits): fonts that look fine on ordinary BoCorpus stacks still break once *tsa-phru* and packed vowel clusters from abbreviation lists show up.
-
-![New placement / hard-fail rules from shorthand review](assets/01-coverage/new_rules_gallery.jpg)
-
-| Rule | Font | Stack (EWTS) | What fails |
-|------|------|--------------|------------|
-| `mid_stem` | DDC Uchen | `k^u+o` | *Zhabs kyu* hangs mid-stem on *ka* |
-| `mid_stem` | Bhozuk Vijahara A | `t+yoM` | *Ya-tag* mid-stem (not only *tsa-phru* cases) |
-| `tsa_phru_mark_shift` | Amdo Classic 2 | `rd^u+e` | *Tsa-phru* shoves *zhabs kyu* / *dengbu* |
-| `tsa_phru_too_low` | Font | `m^aM` | *Tsa-phru* sits too low on *ma* |
-| `bottom_vowel_horizontal_misalignment` | Kokonor | `d^u+o` | Bottom vowel beside the base (baked-in fallback) |
-| `missing_base_letter` | Kokonor | `^u+oM` | Mark-only stack; no base letter |
-
-<p>
-<img src="assets/01-coverage/ex_mid_stem_ddc.png" alt="mid_stem on DDC Uchen" height="140"/>
-&nbsp;
-<img src="assets/01-coverage/ex_tsa_phru_shift.png" alt="tsa_phru_mark_shift on Amdo Classic 2" height="140"/>
-&nbsp;
-<img src="assets/01-coverage/ex_missing_base.png" alt="missing_base_letter on Kokonor" height="140"/>
-</p>
 
 These are intentionally conservative. We keep raw Parquet rows, render audit contact sheets, and retune — a false positive in the coverage gate is a missing page; a false negative is a poisoned label. Known bad `(font, stack)` pairs from review also land in `synthetic_benchmark/data/shorthands/denylist.csv`.
 
@@ -172,16 +152,16 @@ We shaped **218** digital faces (150 `skt_ok=1`, 68 `skt_ok=0`). **208** of them
 
 | Statistic (all 218 faces) | Value |
 |---------------------------|------:|
-| Max coverage | **97.7%** |
-| Median | **66.8%** |
-| Mean | **54.0%** |
+| Max coverage | **95.1%** |
+| Median | **62.4%** |
+| Mean | **52.7%** |
 | Min | **0.7%** |
-| Fonts ≥ 90% | 35 |
-| Fonts ≥ 80% | 75 |
-| Fonts ≥ 50% | 142 |
+| Fonts ≥ 90% | 21 |
+| Fonts ≥ 80% | 64 |
+| Fonts ≥ 50% | 137 |
 | Fonts &lt; 10% | 69 |
 
-Per stack, a typical conjunct is supported by about **54%** of fonts. **44** stacks work everywhere we tested; **39** work nowhere (pathological piles of marks on *shad* / *tsheg*, doubled top signs, etc.).
+Per stack, a typical conjunct is supported by about **53%** of fonts. **47** stacks work everywhere we tested; **252** work nowhere (pathological piles of marks on *shad* / *tsheg*, doubled top signs, etc.).
 
 ### Uchen vs ume (catalog taxonomy)
 
@@ -189,13 +169,13 @@ Per stack, a typical conjunct is supported by about **54%** of fonts. **44** sta
 
 | Script type | Fonts | `skt_ok=1` | Median coverage | Mean | ≥90% | &lt;10% |
 |-------------|------:|-----------:|----------------:|-----:|-----:|------:|
-| **Uchen** | 130 | 93 | **67.0%** | 56.6% | 27 | 37 |
-| **Ume** | 72 | 45 | **73.2%** | 50.9% | 8 | 27 |
-| **Transitional** | 6 | 4 | 54.9% | 45.9% | 0 | 2 |
+| **Uchen** | 130 | 93 | **64.6%** | 56.5% | 19 | 37 |
+| **Ume** | 72 | 45 | **60.3%** | 47.3% | 2 | 27 |
+| **Transitional** | 6 | 4 | 50.6% | 46.0% | 0 | 2 |
 
-Restricting to faces already marked `skt_ok=1`, the medians converge (~**81.8%** uchen vs ~**81.4%** ume): the long left tail is mostly `skt_ok=0` faces that we only trust for the 546 standard stacks (~4.8% ceiling).
+Restricting to faces already marked `skt_ok=1`, medians rise to ~**80.7%** uchen vs ~**75.2%** ume: the long left tail is still mostly `skt_ok=0` faces that we only trust for the 546 standard stacks (~4.8% ceiling).
 
-Within types, the 8-category medians are uneven. On the ume side, **Druma** (oval / *drutsa*) faces sit high (median ~86%), while many **Tsugma** cuts in the catalog are `skt_ok=0` and drag that category’s overall median down. On the uchen side, Zabma and Parma dominate the sample; the strongest individuals are Zabma printscripts and a few Parma / Nama faces.
+Within types, the 8-category medians are uneven. On the ume side, **Druma** (oval / *drutsa*) faces sit highest (median ~76%), while many **Tsugma** cuts in the catalog are `skt_ok=0` and drag that category’s overall median down. On the uchen side, Zabma and Parma dominate the sample; the strongest individuals are Zabma printscripts and a few Parma / Nama faces.
 
 ### Who handles the stacks?
 
@@ -203,26 +183,26 @@ Within types, the 8-category medians are uneven. On the ume side, **Druma** (ova
 
 | Rank | Font | Type | Stacks OK | Coverage |
 |-----:|------|------|----------:|---------:|
-| 1 | Qomolangma-Subtitle | Uchen · Zabma | 11,063 / 11,329 | 97.7% |
-| 2 | Qomolangma-Dunhuang | Uchen · Nama | 11,033 | 97.4% |
-| 3 | Qomolangma-Woodblock | Uchen · Parma | 10,927 | 96.5% |
-| 4 | Noto Serif Tibetan Regular | Uchen · Zabma | 10,884 | 96.1% |
-| 5 | Noto Serif Tibetan Thin | Uchen · Zabma | 10,794 | 95.3% |
-| 6 | Noto Serif Tibetan Black | Uchen · Zabma | 10,749 | 94.9% |
-| 7 | Wujin changgui | Uchen · Zabma | 10,730 | 94.7% |
-| 8 | Rebod | Uchen · Parma | 10,577 | 93.4% |
-| 9 | Monlam Lakdi Ouchen | Uchen · Zabma | 10,571 | 93.3% |
-| 10 | Khampa Dedri Drugang | **Ume · Tsugma** | 10,565 | 93.3% |
+| 1 | Qomolangma-Dunhuang | Uchen · Nama | 10,775 / 11,329 | 95.1% |
+| 2 | Qomolangma-Subtitle | Uchen · Zabma | 10,763 | 95.0% |
+| 3 | Qomolangma-Woodblock | Uchen · Parma | 10,695 | 94.4% |
+| 4 | Noto Serif Tibetan Thin | Uchen · Zabma | 10,597 | 93.5% |
+| 5 | Noto Serif Tibetan Regular | Uchen · Zabma | 10,583 | 93.4% |
+| 6 | Shangshung Khra Tung | **Ume · Druma** | 10,562 | 93.2% |
+| 7 | Noto Serif Tibetan Black | Uchen · Zabma | 10,486 | 92.6% |
+| 8 | Wujin changgui | Uchen · Zabma | 10,425 | 92.0% |
+| 9 | Qomolangma-Title | Uchen · Zabma | 10,417 | 91.9% |
+| 10 | Rebod | Uchen · Zabma | 10,416 | 91.9% |
 
-The overall top ten is almost all uchen — then an ume *tsugdri* face ties Monlam Lakdi. Filename heuristics would have mis-sorted several of these; the script-id join is what makes the uchen/ume split trustworthy for later render planning.
+The overall top ten is mostly uchen — with a Shangshung *drutsa* ume face at #6. Filename heuristics would have mis-sorted several of these; the script-id join is what makes the uchen/ume split trustworthy for later render planning.
 
 ![Top Uchen fonts by stack coverage](assets/01-coverage/top_uchen_coverage.png)
 
 ![Top Ume fonts by stack coverage](assets/01-coverage/top_ume_coverage.png)
 
-**Uchen highlights:** Qomolangma (Subtitle / Dunhuang / Woodblock / Art / Uchen Suring), Noto Serif Tibetan, Wujin, Rebod, Monlam Lakdi Ouchen (best Sugdri-style uchen on this run at 93.3%). Among everyday *kyuyig* / short-uchen faces, coverage drops quickly once you leave the SKT-capable band — DDC Uchen is only **65.2%** despite clearing ordinary probes, mostly on `floating_bottom_vowel` and `subscript_containment`.
+**Uchen highlights:** Qomolangma (Dunhuang / Subtitle / Woodblock / Title / Uchen Suring), Noto Serif Tibetan, Wujin, Rebod, Monlam Lakdi Ouchen (best Sugdri-style uchen on this run at **87.6%**). Among everyday *kyuyig* / short-uchen faces, coverage drops quickly once you leave the SKT-capable band — DDC Uchen is only **66.9%** despite clearing ordinary probes, mostly on `floating_bottom_vowel` and `subscript_containment`.
 
-**Ume highlights:** Khampa Dedri Drugang and Golog Dernang Yigchen (Tsugma, ~92–93%), Qomolangma Betsu / Petsug, Khampa Dedri Drutsa and Qomolangma Drutsa (Druma, ~90–92%), plus Shangshung and Zhuca *drutsa* cuts in the high 80s. The strongest ume faces match the strongest uchen faces on the BoCorpus stack list; weaker ume cuts fail for the same geometry reasons, not because “ume cannot do Sanskrit.”
+**Ume highlights:** Shangshung Khra Tung / Khra Chen (Druma, ~90–93%), Qomolangma Betsu and Khampa Dedri Drugang (Tsugma, ~87–89%), plus Zhuca, Golog Dernang, and Qomolangma *drutsa* cuts in the low-to-mid 80s. The strongest ume faces match the strongest uchen faces on the BoCorpus stack list; weaker ume cuts fail for the same geometry reasons, not because “ume cannot do Sanskrit.”
 
 The practical story for synthetic OCR: **almost every serious face looks fine on everyday Tibetan; uchen and ume diverge (and individual faces diverge) on the long SKT tail.** That is why a binary `skt_ok` flag was never enough for planning pages, and why we replaced it with a per-stack matrix joined back to the script taxonomy.
 

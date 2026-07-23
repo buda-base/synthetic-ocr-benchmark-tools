@@ -1,9 +1,0 @@
-rule,basename,stack,ewts,ok,reason,image
-mid_stem,Ddc_uchen,ཀོུ༹,k^u+o,False,mid_stem,new_mid_stem_Ddc_uchen_369d8e88.png
-mid_stem,Bhozuk_Gendun_Chompel,ཏིུ༹ཾ,t^u+iM,False,bottom_vowel_horizontal_misalignment;mid_stem;tsa_phru_mark_shift,new_mid_stem_Bhozuk_Gendun_Chompel_7f8fed47.png
-mid_stem,Bhozuk_Vijahara_A,ཏྱོཾ,t+yoM,False,mid_stem,new_mid_stem_Bhozuk_Vijahara_A_d8e2f783.png
-bottom_vowel_horizontal_misalignment,Kokonor,དོུ༹,d^u+o,False,bottom_vowel_horizontal_misalignment;tsa_phru_mark_shift,new_bottom_vowel_horizontal_misalignment_Kokonor_da78d69a.png
-tsa_phru_mark_shift,AmdoClassic2,རྡེུ༹,rd^u+e,False,tsa_phru_mark_shift,new_tsa_phru_mark_shift_AmdoClassic2_6847d593.png
-tsa_phru_mark_shift,Amdo_classic_3,ནོ༹,n^o,False,tsa_phru_mark_shift,new_tsa_phru_mark_shift_Amdo_classic_3_65948f9b.png
-tsa_phru_too_low,Font,མ༹ཾ,m^aM,False,tsa_phru_too_low,new_tsa_phru_too_low_Font_af7fa990.png
-missing_base_letter,Kokonor,ོུ༹ཾ,^u+oM,False,missing_base_letter;bottom_vowel_horizontal_misalignment;tsa_phru_mark_shift,new_missing_base_letter_Kokonor_d6c3c71e.png
