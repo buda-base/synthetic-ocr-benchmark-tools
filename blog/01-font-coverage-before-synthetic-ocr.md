@@ -126,10 +126,10 @@ Geometry / placement failures (bounding-box heuristics on the shaped glyphs):
 | `tsa_phru_mark_shift` | Reshape without U+0F39 and compare; fail when *tsa-phru* shoves other marks sideways |
 | `tsa_phru_too_low` | U+0F39 center sits mid-stem instead of near the top-right of the letter |
 | `mark_horizontal_misalignment` | U+0F35 / U+0F37 drift beside the base instead of under/over it |
-| `top_mark_overlap` | Trailing top mark collides with or is swallowed by the body (with a narrow exception for a single mark nesting into the inherent *tsa-phru* tick on ཙ / ཚ / ཛ when it still reaches the head) |
+| `top_mark_overlap` | Trailing top mark collides with or is swallowed by the body. Exception: on ཙ / ཚ / ཛ / ྩ / ྪ / ྫ (inherent *tsa-phru* tick), a *single* top mark that still reaches the base head may nest into the tick; mid-body marks and multi-mark pile-ups still fail |
 | `top_mark_horizontal_misalignment` | Top mark cluster mostly detached left/right |
 | `top_diacritic_collision` | Repeated top marks share identical geometry |
-| `superscript_merge` | Separate *ra-go* mostly merged into the next letter’s head (except over ྩ / ྪ / ྫ, where nesting into the tick is normal) |
+| `superscript_merge` | Separate *ra-go* mostly merged into the next letter’s head. Exception: over ྩ / ྪ / ྫ, nesting into the inherent *tsa-phru* tick is normal and is not flagged |
 | `subscript_horizontal_misalignment` | Next layer beside, not under, the previous one |
 | `subscript_containment` | “Subscript” drawn entirely inside the previous component |
 | `subscript_overlap` | Adjacent layers overlap too much to read as separate |

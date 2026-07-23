@@ -199,9 +199,10 @@ Hard failures:
 - **tsa-phru mark shift** (`tsa_phru_mark_shift`): reshape the same stack without U+0F39 and compare relative-x of the other marks; fail when tsa-phru shoves zhabs-kyu / dengbu / naro / etc. When the without-tsa-phru shape ligates the top mark into the body, fall back to absolute top-mark displacement over the base. Motivating review cases: AmdoClassic2 `rd^u+e`; Amdo_classic_3 `n^o`
 - **tsa-phru too low** (`tsa_phru_too_low`): U+0F39 center sits mid-stem instead of near the top-right of the letter. Motivating review case: Font `m^aM`
 - horizontal below-mark misalignment, where U+0F35 or U+0F37 is drawn too far outside the base stack's horizontal span
-- top mark overlap, where a top mark collides with a top vowel/mark already present in the preceding composite glyph
+- top mark overlap (see exception above for single marks on ཙ / ཚ / ཛ / ྩ / ྪ / ྫ)
 - top mark horizontal misalignment, where a trailing top-mark cluster is drawn mostly to the side of the base stack
 - top diacritic collision, where repeated top marks are drawn with identical geometry
+- superscript merge (see exception above for ra-go over ྩ / ྪ / ྫ)
 - subscript horizontal misalignment, where a subscript layer is drawn mostly to the side instead of under the previous stack layer (also when it has descended but stays horizontally detached). Motivating review cases: MiSansTibetan-Demibold `r+n+roM`; GangJie-Uchen_1 `r+n+yaM`
 - subscript containment, where the final subscript is drawn entirely inside the previous stack component instead of becoming a lower layer
 - subscript overlap, where adjacent subscript layers overlap too much to read as separate vertical layers
@@ -221,7 +222,9 @@ The floating bottom-vowel check is a first-pass geometry heuristic: when a stack
 
 The horizontal below-mark check flags cases where U+0F35 or U+0F37 is emitted as a separate glyph but lies mostly outside the horizontal span of the base stack. The row is flagged with `mark_horizontal_misalignment`.
 
-The top mark overlap check flags cases such as U+0F7A plus U+0F7E where a separately emitted top mark overlaps the preceding composite glyph instead of sitting above it, including cases where a top vowel is swallowed by an earlier body glyph. The row is flagged with `top_mark_overlap`.
+The top mark overlap check flags cases such as U+0F7A plus U+0F7E where a separately emitted top mark overlaps the preceding composite glyph instead of sitting above it, including cases where a top vowel is swallowed by an earlier body glyph. The row is flagged with `top_mark_overlap`. Exception: letters that already include a tsa-phru tick (ཙ / ཚ / ཛ / ྩ / ྪ / ྫ) allow a *single* top mark that still reaches the base head to nest into that tick; mid-body marks and multi-mark pile-ups still fail.
+
+The superscript merge check flags a separate ra-go glyph that is mostly merged into the next letter’s head instead of sitting above it (`superscript_merge`). Exception: when that next letter is ྩ / ྪ / ྫ, nesting into the inherent tsa-phru tick is normal and is not flagged.
 
 The top mark horizontal misalignment check flags trailing top-mark clusters that are mostly detached to the left or right of the base stack. The row is flagged with `top_mark_horizontal_misalignment`.
 
