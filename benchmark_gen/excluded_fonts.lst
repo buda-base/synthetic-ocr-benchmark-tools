@@ -1,0 +1,6 @@
+# Manually excluded from synthetic OCR benchmark generation.
+# Fonts removed after manual review of synthetic samples.
+Rebod-
+Myilam_Carton
+Myilam_Green_Leaf
+Myilam_Masculine

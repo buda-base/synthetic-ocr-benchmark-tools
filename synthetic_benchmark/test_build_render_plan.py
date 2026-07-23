@@ -11,6 +11,7 @@ from build_render_plan import (  # noqa: E402
     build_difficulty_pools,
     chunk_difficulty_tier,
     make_per_font_plan_rows,
+    text_repetition_score,
 )
 from synthetic_common import FontCatalogRow  # noqa: E402
 
@@ -32,6 +33,7 @@ def sample_chunks() -> list[dict[str, object]]:
                 "stacks": f"stack-{index}",
                 "_stack_set": frozenset({f"stack-{index}"}),
                 "stack_difficulty_score": 0.5 if difficult else 0.0,
+                "text_repetition_score": (index % 10) / 10,
             }
         )
     return chunks
@@ -95,6 +97,29 @@ class RenderPlanDifficultyTests(unittest.TestCase):
                 == row["requested_text_difficulty_tier"]
                 for row in first
             )
+        )
+        self.assertEqual(
+            Counter(row["source_text_repetition_policy"] for row in first),
+            Counter({"penalized": 9, "rewarded": 1}),
+        )
+        rewarded_score = next(
+            row["source_text_repetition_score"]
+            for row in first
+            if row["source_text_repetition_policy"] == "rewarded"
+        )
+        penalized_scores = [
+            row["source_text_repetition_score"]
+            for row in first
+            if row["source_text_repetition_policy"] == "penalized"
+        ]
+        self.assertGreater(rewarded_score, max(penalized_scores))
+
+    def test_repetition_score_distinguishes_repeated_sequences(self) -> None:
+        diverse = "བོད་ཡིག་སྐད་རིགས་གཞུང་ལུགས་མཛོད།"
+        repeated = "བོད་ཡིག་བོད་ཡིག་བོད་ཡིག་བོད་ཡིག།"
+        self.assertGreater(
+            text_repetition_score(repeated),
+            text_repetition_score(diverse),
         )
 
     def test_fonts_without_rare_compatible_stacks_use_relative_difficulty(self) -> None:

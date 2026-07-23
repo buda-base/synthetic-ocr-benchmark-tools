@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import boto3
 from PIL import Image, ImageOps
+from tqdm import tqdm
 
 
 DEFAULT_BACKGROUND_MANIFEST = (
@@ -165,9 +166,14 @@ def prepare_paper_background_cache(
     if pending:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             list(
-                executor.map(
-                    lambda item: _download_background(item[0], item[1]),
-                    pending,
+                tqdm(
+                    executor.map(
+                        lambda item: _download_background(item[0], item[1]),
+                        pending,
+                    ),
+                    total=len(pending),
+                    desc="Cache paper backgrounds",
+                    unit="image",
                 )
             )
         resolved.update(

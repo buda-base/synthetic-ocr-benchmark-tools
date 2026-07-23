@@ -1,0 +1,13 @@
+augraphy
+boto3
+botok
+fonttools
+numpy
+opencv-contrib-python-headless
+pillow
+pyarrow
+scipy
+skia-pathops
+skia-python
+tqdm
+uharfbuzz

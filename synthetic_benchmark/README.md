@@ -103,6 +103,12 @@ structurally complex coverage-compatible common chunks instead. The rarity tier
 and fallback basis are recorded separately, before shorthand or other text
 augmentation.
 
+Repetition is balanced independently from rarity. For each font, nine out of
+every ten source-text slots prefer the least repetitive compatible chunks; the
+tenth deliberately prefers highly repetitive text so that 10% remains covered.
+The score compares dominant syllables, adjacent repeats, and repeated bigrams
+and trigrams. The score and requested policy are stored in the render plan.
+
 ## 2b. Review font-level augmentation
 
 Font augmentation is experimental and remains separate from dataset rendering until
@@ -188,13 +194,25 @@ After review, enable the same policy directly in page generation:
   --jobs 4
 ```
 
-`--font-augmentation-variants N` is disabled by default. When enabled, the
-renderer generates and validates `N` deterministic combined variants for every
-source font represented in the remaining render-plan rows. Pages for that font
-are distributed stably across the pool and LuaLaTeX batches are split by variant.
+`--font-augmentation-variants N` is disabled by default and capped at 12. When
+enabled, the renderer generates and validates `N` deterministic combined
+variants for every source font represented in the remaining render-plan rows.
+Pages for that font are distributed stably across the pool and LuaLaTeX batches
+are split by variant. Font pools are prepared in parallel with
+`--font-augmentation-workers` (default 4).
 The approved policy samples width from `0.80–1.20`, uses a near-upright-weighted
 negative slant distribution ending at `-14°`, and applies conservative
 directional stroke changes to half of variants.
+
+Every validated variant has an immutable name derived from the source-font
+SHA-256, TTC face index, and complete augmentation specification. Validated
+fonts and JSON sidecars are read from or written to
+`s3://bec.bdrc.io/synthetic/font_cache/` by default; override with
+`--font-augmentation-s3-cache-uri`, or pass an empty value to disable remote
+caching. If every bounded attempt for a font fails safety validation, a
+policy-keyed negative decision is also cached. Identical future runs immediately
+use the original font, while a changed policy version, seed, requested count, or
+probe set can evaluate it again.
 
 Generated fonts and QC probe renders live temporarily under
 `OUT_DIR/.font_augmentation_cache/` and are removed in a `finally` block after

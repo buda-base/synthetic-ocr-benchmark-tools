@@ -6,12 +6,16 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+from tqdm import tqdm
+
 from font_augmentation import AugmentationSpec, create_augmented_font, source_sha256
-from font_augmentation_raster_qc import compare_rasters
+from font_augmentation_raster_qc import RASTER_QC_VERSION, compare_rasters
+from font_variant_cache import DEFAULT_FONT_CACHE_URI, S3FontVariantCache
 from render_font_augmentation_audit import (
     coverage_font_row,
     load_probes,
@@ -30,6 +34,8 @@ HARD_SHAPING_REASONS = {
     "zero_ink",
     "missing_base_letter",
 }
+MAX_FONT_AUGMENTATION_VARIANTS = 12
+FONT_AUGMENTATION_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,54 @@ class RuntimeVariant:
     @property
     def labels(self) -> str:
         return "|".join(spec.label for spec in self.specs)
+
+
+def font_augmentation_policy(
+    *,
+    seed: int,
+    count: int,
+    probes_path: Path,
+    max_attempts: int,
+) -> tuple[str, dict[str, object]]:
+    policy = {
+        "version": FONT_AUGMENTATION_POLICY_VERSION,
+        "raster_qc_version": RASTER_QC_VERSION,
+        "seed": seed,
+        "requested_variants": count,
+        "max_attempts": max_attempts,
+        "probes_sha256": hashlib.sha256(probes_path.read_bytes()).hexdigest(),
+    }
+    payload = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()[:20], policy
+
+
+def original_font_fallback(
+    source: Path,
+    source_hash: str,
+    face_index: int,
+    *,
+    reason: str,
+    attempted_variants: int,
+    decision_uri: str = "",
+) -> RuntimeVariant:
+    provenance: dict[str, object] = {
+        "operation": "original_font_fallback",
+        "source": str(source),
+        "reason": reason,
+    }
+    if decision_uri:
+        provenance["decision_uri"] = decision_uri
+    return RuntimeVariant(
+        variant_id=f"original-{source_hash[:20]}-f{face_index:03d}",
+        path=source,
+        specs=(),
+        raster_qc={
+            "status": "original_font_fallback",
+            "warnings": [],
+            "attempted_variants": attempted_variants,
+        },
+        provenance=(provenance,),
+    )
 
 
 def _sample_slant(rng: random.Random) -> float:
@@ -174,11 +228,46 @@ def generate_variants_for_font(
     probes_path: Path = DEFAULT_PROBES,
     fontforge_bin: str = "fontforge",
     hb_view_bin: str = "hb-view",
+    remote_cache: S3FontVariantCache | None = None,
 ) -> tuple[list[RuntimeVariant], list[dict[str, object]]]:
-    """Generate exactly ``count`` accepted variants or raise after bounded retries."""
+    """Generate up to ``count`` safe variants, falling back to the source font."""
+    if count > MAX_FONT_AUGMENTATION_VARIANTS:
+        raise ValueError(
+            f"At most {MAX_FONT_AUGMENTATION_VARIANTS} variants may be generated per font"
+        )
     source = Path(str(row["font_abs_path"])).resolve()
     face_index = int(str(row.get("ttc_face_index") or "0"))
     source_hash = source_sha256(source)
+    max_attempts = max(count * 6, count + 5)
+    policy_key, policy = font_augmentation_policy(
+        seed=seed,
+        count=count,
+        probes_path=probes_path,
+        max_attempts=max_attempts,
+    )
+    if remote_cache is not None:
+        decision = remote_cache.fetch_unaugmentable(
+            source_hash=source_hash,
+            face_index=face_index,
+            policy_key=policy_key,
+        )
+        if decision is not None:
+            rejected_attempts = list(decision.get("rejected_attempts") or [])
+            return [
+                original_font_fallback(
+                    source,
+                    source_hash,
+                    face_index,
+                    reason=str(decision["reason"]),
+                    attempted_variants=int(
+                        decision.get("policy", {}).get(
+                            "max_attempts",
+                            len(rejected_attempts),
+                        )
+                    ),
+                    decision_uri=str(decision["s3_uri"]),
+                )
+            ], rejected_attempts
     rng = random.Random(_font_seed(seed, source_hash, face_index))
     probes = load_probes(probes_path)
     stacks = probe_stacks(probes)
@@ -197,11 +286,9 @@ def generate_variants_for_font(
     )
     if not render_ok:
         raise RuntimeError(f"Could not render augmentation baseline for {source.name}: {render_error}")
-
     accepted: list[RuntimeVariant] = []
     rejected: list[dict[str, object]] = []
     seen: set[tuple[tuple[str, float], ...]] = set()
-    max_attempts = max(count * 6, count + 5)
     for _attempt in range(max_attempts):
         if len(accepted) >= count:
             break
@@ -211,6 +298,30 @@ def generate_variants_for_font(
             continue
         seen.add(spec_key)
         variant_id = _combined_variant_id(source_hash, face_index, specs)
+        spec_payload = [
+            {"operation": spec.operation, "value": spec.value}
+            for spec in specs
+        ]
+        if remote_cache is not None:
+            cached = remote_cache.fetch(
+                basename=str(row["basename"]),
+                source_hash=source_hash,
+                face_index=face_index,
+                variant_id=variant_id,
+                specs=spec_payload,
+                raster_qc_version=RASTER_QC_VERSION,
+            )
+            if cached is not None:
+                accepted.append(
+                    RuntimeVariant(
+                        variant_id=variant_id,
+                        path=cached.path,
+                        specs=specs,
+                        raster_qc=cached.raster_qc,
+                        provenance=cached.provenance,
+                    )
+                )
+                continue
         try:
             path, provenance = _apply_specs(
                 source,
@@ -236,15 +347,25 @@ def generate_variants_for_font(
             raster_qc = compare_rasters(baseline_png, variant_png)
             if not raster_qc["automatic_pass"]:
                 raise ValueError(f"raster QC failed: {raster_qc['warnings']}")
-            accepted.append(
-                RuntimeVariant(
+            runtime_variant = RuntimeVariant(
+                variant_id=variant_id,
+                path=path,
+                specs=specs,
+                raster_qc=raster_qc,
+                provenance=provenance,
+            )
+            if remote_cache is not None:
+                remote_cache.store(
+                    basename=str(row["basename"]),
+                    source_hash=source_hash,
+                    face_index=face_index,
                     variant_id=variant_id,
-                    path=path,
-                    specs=specs,
+                    specs=spec_payload,
+                    font_path=path,
                     raster_qc=raster_qc,
                     provenance=provenance,
                 )
-            )
+            accepted.append(runtime_variant)
         except Exception as exc:
             rejected.append(
                 {
@@ -253,10 +374,29 @@ def generate_variants_for_font(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
-    if len(accepted) != count:
-        raise RuntimeError(
-            f"Generated only {len(accepted)}/{count} accepted variants for {source.name} "
-            f"after {max_attempts} attempts"
+    if not accepted:
+        reason = (
+            f"No safe augmented variant was accepted after {max_attempts} attempts"
+        )
+        decision_uri = ""
+        if remote_cache is not None:
+            decision_uri = remote_cache.store_unaugmentable(
+                source_hash=source_hash,
+                face_index=face_index,
+                policy_key=policy_key,
+                policy=policy,
+                reason=reason,
+                rejected_attempts=rejected,
+            )
+        accepted.append(
+            original_font_fallback(
+                source,
+                source_hash,
+                face_index,
+                reason=reason,
+                attempted_variants=max_attempts,
+                decision_uri=decision_uri,
+            )
         )
     return accepted, rejected
 
@@ -291,10 +431,18 @@ def prepare_font_variants(
     probes_path: Path = DEFAULT_PROBES,
     fontforge_bin: str = "fontforge",
     hb_view_bin: str = "hb-view",
+    workers: int = 1,
+    s3_cache_uri: str = DEFAULT_FONT_CACHE_URI,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Generate per-font pools and attach one temporary variant to every plan row."""
     if variants_per_font <= 0:
         raise ValueError("variants_per_font must be positive")
+    if variants_per_font > MAX_FONT_AUGMENTATION_VARIANTS:
+        raise ValueError(
+            f"variants_per_font cannot exceed {MAX_FONT_AUGMENTATION_VARIANTS}"
+        )
+    if workers <= 0:
+        raise ValueError("workers must be positive")
     groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
     for row in rows:
         key = (
@@ -306,15 +454,45 @@ def prepare_font_variants(
 
     prepared: list[dict[str, object]] = []
     manifest_fonts: list[dict[str, object]] = []
-    for (_path, _face, basename), font_rows in sorted(groups.items()):
+    remote_cache = (
+        S3FontVariantCache(s3_cache_uri, cache_dir / "s3")
+        if s3_cache_uri
+        else None
+    )
+
+    def generate_group(group):
+        (_path, face, basename), font_rows = group
         variants, rejected = generate_variants_for_font(
             font_rows[0],
             count=variants_per_font,
             seed=seed,
-            cache_dir=cache_dir / basename,
+            cache_dir=cache_dir / f"{basename}__face_{face or '0'}",
             probes_path=probes_path,
             fontforge_bin=fontforge_bin,
             hb_view_bin=hb_view_bin,
+            remote_cache=remote_cache,
+        )
+        return basename, font_rows, variants, rejected
+
+    group_items = sorted(groups.items())
+    executor = ThreadPoolExecutor(max_workers=min(workers, len(group_items)))
+    futures = {executor.submit(generate_group, group): group for group in group_items}
+    font_progress = tqdm(
+        as_completed(futures),
+        total=len(futures),
+        desc="Generate and validate font variants",
+        unit="font",
+    )
+    for future in font_progress:
+        basename, font_rows, variants, rejected = future.result()
+        cache_hits = sum(
+            1
+            for variant in variants
+            if any(step.get("operation") == "s3_cache" for step in variant.provenance)
+        )
+        font_progress.set_postfix_str(
+            f"{basename} ({len(variants)}/{variants_per_font}, "
+            f"{cache_hits} cached, {len(rejected)} rejected)"
         )
         prepared.extend(assign_variants_to_rows(font_rows, variants))
         manifest_fonts.append(
@@ -323,6 +501,7 @@ def prepare_font_variants(
                 "source_font": str(font_rows[0]["font_abs_path"]),
                 "source_face_index": str(font_rows[0].get("ttc_face_index") or ""),
                 "requested_variants": variants_per_font,
+                "s3_cache_hits": cache_hits,
                 "accepted": [
                     {
                         "variant_id": variant.variant_id,
@@ -335,10 +514,16 @@ def prepare_font_variants(
                 "rejected_attempts": rejected,
             }
         )
+    executor.shutdown(wait=True)
     prepared.sort(key=lambda row: int(row["image_id"]))
+    manifest_fonts.sort(
+        key=lambda item: (str(item["basename"]), str(item["source_face_index"]))
+    )
     return prepared, {
         "seed": seed,
         "variants_per_font": variants_per_font,
+        "workers": workers,
+        "s3_cache_uri": s3_cache_uri,
         "font_count": len(manifest_fonts),
         "fonts": manifest_fonts,
     }

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import random
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ from synthetic_common import (
 GROUP_SIZE = 1000
 SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 SPLITS = tuple(SPLIT_RATIOS)
+TEXT_BOUNDARIES = re.compile(r"[\s\u0f0b\u0f0c\u0f0d-\u0f14]+")
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +107,9 @@ def load_chunks(path: Path) -> list[dict[str, object]]:
             chunk["stack_difficulty_score"] = stack_difficulty_score(str(chunk.get("text") or ""))
         else:
             chunk["stack_difficulty_score"] = float(chunk["stack_difficulty_score"])
+        chunk["text_repetition_score"] = text_repetition_score(
+            str(chunk.get("text") or "")
+        )
     return chunks
 
 
@@ -127,13 +132,47 @@ def chunk_difficulty_tier(chunk: dict[str, object]) -> str:
     return "difficult" if float(chunk["stack_difficulty_score"]) > 0 else "normal"
 
 
+def text_repetition_score(text: str) -> float:
+    """Score repeated Tibetan sequences; 0 is diverse and 1 is highly repetitive."""
+    tokens = [
+        token
+        for token in TEXT_BOUNDARIES.split(text)
+        if token and any("\u0f00" <= char <= "\u0fff" for char in token)
+    ]
+    if len(tokens) < 2:
+        return 0.0
+    counts = Counter(tokens)
+    dominant_fraction = max(counts.values()) / len(tokens)
+    adjacent_fraction = sum(
+        left == right for left, right in zip(tokens, tokens[1:])
+    ) / (len(tokens) - 1)
+
+    def repeated_ngram_fraction(size: int) -> float:
+        total = len(tokens) - size + 1
+        if total <= 1:
+            return 0.0
+        ngrams = {
+            tuple(tokens[index : index + size])
+            for index in range(total)
+        }
+        return 1.0 - len(ngrams) / total
+
+    score = max(
+        dominant_fraction,
+        adjacent_fraction,
+        repeated_ngram_fraction(3),
+        repeated_ngram_fraction(2) * 0.8,
+    )
+    return round(score, 6)
+
+
 def build_difficulty_pools(
     chunks: list[dict[str, object]],
 ) -> dict[str, list[dict[str, object]]]:
     normal_chunks = [
         chunk for chunk in chunks if chunk_difficulty_tier(chunk) == "normal"
     ]
-    return {
+    pools = {
         "normal": sorted(
             normal_chunks,
             key=lambda row: (
@@ -159,6 +198,22 @@ def build_difficulty_pools(
             key=lambda row: (-float(row["stack_difficulty_score"]), str(row["chunk_id"])),
         ),
     }
+    for tier, pool in list(pools.items()):
+        pools[f"{tier}_penalized_repetition"] = sorted(
+            pool,
+            key=lambda row: (
+                float(
+                    row.get("text_repetition_score")
+                    if row.get("text_repetition_score") is not None
+                    else text_repetition_score(str(row.get("text") or ""))
+                ),
+                str(row["chunk_id"]),
+            ),
+        )
+        pools[f"{tier}_rewarded_repetition"] = list(
+            reversed(pools[f"{tier}_penalized_repetition"])
+        )
+    return pools
 
 
 def split_target_counts(total: int) -> dict[str, int]:
@@ -282,6 +337,7 @@ def _plan_row_dict(
     script: str,
     split: str,
     requested_text_difficulty_tier: str,
+    requested_text_repetition_policy: str,
     selected_pool: str,
 ) -> dict[str, object]:
     rarity_tier = chunk_difficulty_tier(chunk)
@@ -314,6 +370,17 @@ def _plan_row_dict(
         "source_text_difficulty_basis": difficulty_basis,
         "source_text_selection_pool": selected_pool,
         "requested_text_difficulty_tier": requested_text_difficulty_tier,
+        "source_text_repetition_score": float(
+            chunk.get("text_repetition_score")
+            if chunk.get("text_repetition_score") is not None
+            else text_repetition_score(str(chunk.get("text") or ""))
+        ),
+        "source_text_repetition_policy": requested_text_repetition_policy,
+        "source_text_repetition_basis": (
+            "high_repetition_preferred"
+            if requested_text_repetition_policy == "rewarded"
+            else "low_repetition_preferred"
+        ),
         "basename": font.basename,
         "font_name": font_name(font),
         "font_file": font.font_file,
@@ -409,16 +476,20 @@ def make_per_font_plan_rows(
         for slot in range(images_per_font):
             chunk = None
             requested_tier = "normal" if slot % 2 == 0 else "difficult"
+            requested_repetition_policy = (
+                "rewarded" if slot % 10 == 9 else "penalized"
+            )
             candidate_tiers = (
                 ("difficult", "relative_difficult")
                 if requested_tier == "difficult"
                 else ("normal", "difficult")
             )
             for tier in candidate_tiers:
+                pool_key = f"{tier}_{requested_repetition_policy}_repetition"
                 for allow_reuse in (False, True):
                     chunk = next_chunk_for_font(
                         font_info,
-                        difficulty_pools[tier],
+                        difficulty_pools[pool_key],
                         supported,
                         used_font_chunks,
                         chunk_split,
@@ -426,7 +497,7 @@ def make_per_font_plan_rows(
                         reused_chunk_ids,
                         max_reused_chunks,
                         cursors,
-                        tier=tier,
+                        tier=pool_key,
                         allow_reuse=allow_reuse,
                     )
                     if chunk is not None:
@@ -449,6 +520,7 @@ def make_per_font_plan_rows(
                     script=script,
                     split=split,
                     requested_text_difficulty_tier=requested_tier,
+                    requested_text_repetition_policy=requested_repetition_policy,
                     selected_pool=tier,
                 )
             )
@@ -570,16 +642,23 @@ def make_plan_rows(
                             if font_counts["normal"] <= font_counts["difficult"]
                             else "difficult"
                         )
+                        font_slot = font_counts["normal"] + font_counts["difficult"]
+                        requested_repetition_policy = (
+                            "rewarded" if font_slot % 10 == 9 else "penalized"
+                        )
                         chunk = None
                         for tier in (
                             ("difficult", "relative_difficult")
                             if requested_tier == "difficult"
                             else ("normal", "difficult")
                         ):
+                            pool_key = (
+                                f"{tier}_{requested_repetition_policy}_repetition"
+                            )
                             for allow_reuse in (False, True):
                                 chunk = next_chunk_for_font(
                                     font_info,
-                                    difficulty_pools[tier],
+                                    difficulty_pools[pool_key],
                                     supported,
                                     used_font_chunks,
                                     chunk_split,
@@ -587,7 +666,7 @@ def make_plan_rows(
                                     reused_chunk_ids,
                                     max_reused_chunks,
                                     cursors,
-                                    tier=tier,
+                                    tier=pool_key,
                                     allow_reuse=allow_reuse,
                                 )
                                 if chunk is not None:
@@ -611,6 +690,9 @@ def make_plan_rows(
                                     script=script,
                                     split=split,
                                     requested_text_difficulty_tier=requested_tier,
+                                    requested_text_repetition_policy=(
+                                        requested_repetition_policy
+                                    ),
                                     selected_pool=tier,
                                 )
                             )
@@ -668,8 +750,18 @@ def oversample_ume_dense_rows(
     used_font_chunks: set[tuple[str, str]],
 ) -> None:
     """Append ~1 extra compatible chunk to ume even-image rows for dense shorthand fill."""
-    # Prefer harder unused chunks first, then allow already-used ones as filler.
-    ordered = sorted(chunks, key=lambda row: float(row["stack_difficulty_score"]), reverse=True)
+    low_repetition = sorted(
+        chunks,
+        key=lambda chunk: (
+            float(
+                chunk.get("text_repetition_score")
+                if chunk.get("text_repetition_score") is not None
+                else text_repetition_score(str(chunk.get("text") or ""))
+            ),
+            -float(chunk["stack_difficulty_score"]),
+        ),
+    )
+    high_repetition = list(reversed(low_repetition))
     oversampled = 0
     for row in rows:
         if str(row.get("script") or "") != "ume":
@@ -691,6 +783,11 @@ def oversample_ume_dense_rows(
             continue
         existing_ids = set(str(row.get("chunk_id") or "").split("|"))
         extra = None
+        ordered = (
+            high_repetition
+            if row.get("source_text_repetition_policy") == "rewarded"
+            else low_repetition
+        )
         for allow_used in (False, True):
             for chunk in ordered:
                 chunk_id = str(chunk["chunk_id"])
@@ -717,6 +814,7 @@ def oversample_ume_dense_rows(
         row["unique_stack_count"] = len(unique_stacks)
         row["stacks"] = " ".join(unique_stacks)
         row["stack_difficulty_score"] = stack_difficulty_score(combined_text)
+        row["source_text_repetition_score"] = text_repetition_score(combined_text)
         row["chunk_id"] = f"{row['chunk_id']}|{extra['chunk_id']}"
         row["etext_source"] = (
             f"{row['etext_source']}|bocorpus:{extra['bocorpus_row']}:"
@@ -748,6 +846,13 @@ def write_summary(rows: list[dict[str, object]], output: Path) -> None:
         ),
         "font_text_difficulty_tier": Counter(
             f"{row['basename']}|{row['source_text_difficulty_tier']}" for row in rows
+        ),
+        "source_text_repetition_policy": Counter(
+            row["source_text_repetition_policy"] for row in rows
+        ),
+        "font_text_repetition_policy": Counter(
+            f"{row['basename']}|{row['source_text_repetition_policy']}"
+            for row in rows
         ),
     }
     reused_chunks = sum(1 for _chunk_id, count in Counter(row["chunk_id"] for row in rows).items() if count > 1)

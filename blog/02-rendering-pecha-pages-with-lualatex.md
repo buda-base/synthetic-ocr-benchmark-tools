@@ -67,6 +67,21 @@ fallback basis are recorded separately in
 `source_text_difficulty_basis`. Counts can differ by one when a font receives an
 odd number of pages.
 
+The planner also controls source repetition per font: 90% of slots prefer
+low-repetition chunks, while 10% deliberately prefer repetitive chunks to keep
+that phenomenon represented. Repetition is scored from dominant syllables,
+adjacent duplicates, and repeated bigrams and trigrams, independently of the
+normal/difficult rarity balance.
+
+Concretely, each rarity pool has two deterministic orderings. Nine slots out of
+ten draw from the lowest scores first; the tenth draws from the highest scores
+first. The score is the maximum of the dominant-syllable fraction, adjacent
+duplicate fraction, repeated-trigram fraction, and a down-weighted repeated-
+bigram fraction. The requested policy and measured score are retained as
+`source_text_repetition_policy` (`penalized` or `rewarded`) and
+`source_text_repetition_score`, so downstream audits can distinguish deliberate
+repetition coverage from accidental repetition.
+
 At render time, chunks that overflow a physical page contribute only their **first** page to the benchmark; short underfull pages can be merged with the next chunk and re-rendered. Failures are logged per batch; successful batches checkpoint so long runs are resumable.
 
 ---

@@ -98,6 +98,24 @@ class RasterQCTests(unittest.TestCase):
             result = compare_rasters(baseline_path, variant_path)
             self.assertIn("counter_loss_or_black_fill", result["warnings"])
 
+    def test_detects_new_tiny_ink_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            baseline_path = Path(directory) / "baseline.png"
+            variant_path = Path(directory) / "variant.png"
+            baseline = Image.new("L", (240, 100), "white")
+            draw = ImageDraw.Draw(baseline)
+            for x in range(10, 220, 30):
+                draw.rectangle((x, 25, x + 18, 70), fill="black")
+            baseline.save(baseline_path)
+            variant = baseline.copy()
+            draw = ImageDraw.Draw(variant)
+            for x in range(15, 195, 30):
+                draw.rectangle((x, 85, x + 2, 87), fill="black")
+            variant.save(variant_path)
+            result = compare_rasters(baseline_path, variant_path)
+            self.assertIn("tiny_component_excess", result["warnings"])
+            self.assertGreaterEqual(result["tiny_component_excess"], 4)
+
 
 class RuntimeAugmentationTests(unittest.TestCase):
     def test_sampled_policy_stays_within_reviewed_ranges(self) -> None:

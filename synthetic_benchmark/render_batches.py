@@ -14,8 +14,10 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +27,11 @@ from PIL import Image
 from tqdm import tqdm
 
 from font_augmentation_runtime import DEFAULT_PROBES as DEFAULT_FONT_AUGMENTATION_PROBES
-from font_augmentation_runtime import prepare_font_variants
+from font_augmentation_runtime import (
+    MAX_FONT_AUGMENTATION_VARIANTS,
+    prepare_font_variants,
+)
+from font_variant_cache import DEFAULT_FONT_CACHE_URI
 from paper_backgrounds import DEFAULT_BACKGROUND_MANIFEST
 from shorthand_aug import (
     DEFAULT_DENYLIST_CSV,
@@ -113,10 +119,17 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=(
             "Generate N validated temporary outline variants per source font and "
-            "distribute that font's pages across them (default: disabled)."
+            f"distribute that font's pages across them; maximum "
+            f"{MAX_FONT_AUGMENTATION_VARIANTS} (default: disabled)."
         ),
     )
     parser.add_argument("--font-augmentation-seed", type=int, default=13)
+    parser.add_argument("--font-augmentation-workers", type=int, default=4)
+    parser.add_argument(
+        "--font-augmentation-s3-cache-uri",
+        default=DEFAULT_FONT_CACHE_URI,
+        help="Immutable validated font cache; pass an empty string to disable.",
+    )
     parser.add_argument(
         "--font-augmentation-probes",
         type=Path,
@@ -629,6 +642,23 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
         first["source_text_rarity_tier"] = (
             next(iter(rarity_tiers)) if len(rarity_tiers) == 1 else "mixed"
         )
+    first["source_text_repetition_score"] = max(
+        float(first.get("source_text_repetition_score") or 0.0),
+        float(second.get("source_text_repetition_score") or 0.0),
+    )
+    repetition_policies = {
+        str(first.get("source_text_repetition_policy") or ""),
+        str(second.get("source_text_repetition_policy") or ""),
+    } - {""}
+    if repetition_policies:
+        first["source_text_repetition_policy"] = (
+            "rewarded" if "rewarded" in repetition_policies else "penalized"
+        )
+        first["source_text_repetition_basis"] = (
+            "high_repetition_preferred"
+            if first["source_text_repetition_policy"] == "rewarded"
+            else "low_repetition_preferred"
+        )
     return first
 
 
@@ -875,6 +905,17 @@ def write_text_and_catalog(
                 ),
                 "requested_text_difficulty_tier": (
                     row.get("requested_text_difficulty_tier") or ""
+                ),
+                "source_text_repetition_score": (
+                    float(row["source_text_repetition_score"])
+                    if row.get("source_text_repetition_score") not in (None, "")
+                    else None
+                ),
+                "source_text_repetition_policy": (
+                    row.get("source_text_repetition_policy") or ""
+                ),
+                "source_text_repetition_basis": (
+                    row.get("source_text_repetition_basis") or ""
                 ),
                 "suggested_split": row.get("suggested_split") or "",
                 "bocorpus_row": "|".join(row["_source_bocorpus_rows"]),
@@ -1479,6 +1520,17 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "requested_text_difficulty_tier": (
                     row.get("requested_text_difficulty_tier") or ""
                 ),
+                "source_text_repetition_score": (
+                    float(row["source_text_repetition_score"])
+                    if row.get("source_text_repetition_score") not in (None, "")
+                    else None
+                ),
+                "source_text_repetition_policy": (
+                    row.get("source_text_repetition_policy") or ""
+                ),
+                "source_text_repetition_basis": (
+                    row.get("source_text_repetition_basis") or ""
+                ),
                 "suggested_split": row.get("suggested_split") or "",
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
                 "font_augmentation_specs": row.get("font_augmentation_specs") or "",
@@ -1825,6 +1877,17 @@ def render_planned_rows(
     print(f"Benchmark metadata now has {len(catalog_rows)} image(s)")
 
 
+@contextmanager
+def timed_stage(label: str):
+    started = time.monotonic()
+    print(f"[stage] {label}...", flush=True)
+    try:
+        yield
+    finally:
+        elapsed = time.monotonic() - started
+        print(f"[stage] {label} finished in {elapsed:.1f}s", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     if args.image_width_px is not None:
@@ -1854,7 +1917,8 @@ def main() -> None:
                 f"Loaded {len(existing_catalog_rows)} checkpointed output image row(s), "
                 f"covering {len(completed_plan_ids(existing_catalog_rows))} plan row(s)."
             )
-    rows = pq.read_table(args.render_plan).to_pylist()
+    with timed_stage("Load render plan"):
+        rows = pq.read_table(args.render_plan).to_pylist()
     rows.sort(key=lambda row: int(row["image_id"]))
     if args.limit is not None:
         rows = rows[: args.limit]
@@ -1965,8 +2029,11 @@ def main() -> None:
         skipped = before - len(rows)
         if skipped:
             print(f"Resuming: skipped {skipped} already rendered plan row(s)")
-    if args.font_augmentation_variants < 0:
-        raise SystemExit("--font-augmentation-variants cannot be negative")
+    if not 0 <= args.font_augmentation_variants <= MAX_FONT_AUGMENTATION_VARIANTS:
+        raise SystemExit(
+            f"--font-augmentation-variants must be between 0 and "
+            f"{MAX_FONT_AUGMENTATION_VARIANTS}"
+        )
 
     augmentation_cache: Path | None = None
     rendering_finished = False
@@ -1974,32 +2041,39 @@ def main() -> None:
         if args.document_augmentation:
             from paper_backgrounds import prepare_paper_background_cache
 
-            resolved_backgrounds = prepare_paper_background_cache(
-                rows,
-                paper_backgrounds,
-                cache_dir=args.out_dir / ".paper_background_cache",
-                local_review_dir=(
-                    args.paper_background_dir
-                    if args.paper_background_dir.exists()
-                    else None
-                ),
-                workers=args.paper_background_download_workers,
-            )
+            with timed_stage("Resolve paper backgrounds"):
+                resolved_backgrounds = prepare_paper_background_cache(
+                    rows,
+                    paper_backgrounds,
+                    cache_dir=args.out_dir / ".paper_background_cache",
+                    local_review_dir=(
+                        args.paper_background_dir
+                        if args.paper_background_dir.exists()
+                        else None
+                    ),
+                    workers=args.paper_background_download_workers,
+                )
             print(
                 f"Resolved {len(resolved_backgrounds)} selected paper background(s) "
                 "for remaining render rows"
             )
         if args.font_augmentation_variants:
             augmentation_cache = args.out_dir / ".font_augmentation_cache"
-            rows, manifest = prepare_font_variants(
-                rows,
-                variants_per_font=args.font_augmentation_variants,
-                seed=args.font_augmentation_seed,
-                cache_dir=augmentation_cache,
-                probes_path=args.font_augmentation_probes,
-                fontforge_bin=args.fontforge,
-                hb_view_bin=args.hb_view,
-            )
+            with timed_stage(
+                f"Generate and validate font variants "
+                f"({args.font_augmentation_variants} per font)"
+            ):
+                rows, manifest = prepare_font_variants(
+                    rows,
+                    variants_per_font=args.font_augmentation_variants,
+                    seed=args.font_augmentation_seed,
+                    cache_dir=augmentation_cache,
+                    probes_path=args.font_augmentation_probes,
+                    fontforge_bin=args.fontforge,
+                    hb_view_bin=args.hb_view,
+                    workers=args.font_augmentation_workers,
+                    s3_cache_uri=args.font_augmentation_s3_cache_uri,
+                )
             manifest_path = args.out_dir / "font_augmentation_manifest.json"
             manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -2010,7 +2084,8 @@ def main() -> None:
                 f"variant(s) for each of {manifest['font_count']} source font(s)"
             )
             print(f"Wrote {manifest_path}")
-        render_planned_rows(rows, args, existing_catalog_rows)
+        with timed_stage("Render and post-process pages"):
+            render_planned_rows(rows, args, existing_catalog_rows)
         rendering_finished = True
     finally:
         if (

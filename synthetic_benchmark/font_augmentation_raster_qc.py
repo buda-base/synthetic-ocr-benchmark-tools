@@ -10,6 +10,17 @@ from PIL import Image
 from scipy import ndimage
 
 
+RASTER_QC_VERSION = 2
+COMPONENT_SIZE_BINS = (4, 8, 16, 32, 64, 128, 256)
+
+
+def _component_sizes(mask: np.ndarray) -> np.ndarray:
+    labels, count = ndimage.label(mask)
+    if count == 0:
+        return np.asarray([], dtype=np.int64)
+    return np.bincount(labels.ravel())[1:]
+
+
 def _component_count(mask: np.ndarray, *, enclosed_only: bool) -> int:
     labels, count = ndimage.label(mask)
     if count == 0:
@@ -25,7 +36,7 @@ def _component_count(mask: np.ndarray, *, enclosed_only: bool) -> int:
     return int(eligible.sum())
 
 
-def raster_metrics(path: Path, *, threshold: int = 128) -> dict[str, float | int]:
+def raster_metrics(path: Path, *, threshold: int = 128) -> dict[str, object]:
     pixels = np.asarray(Image.open(path).convert("L"))
     ink = pixels < threshold
     ys, xs = np.where(ink)
@@ -37,8 +48,14 @@ def raster_metrics(path: Path, *, threshold: int = 128) -> dict[str, float | int
             "enclosed_holes": 0,
             "content_width": 0,
             "content_height": 0,
+            "component_size_p10": 0.0,
+            "small_component_counts": {
+                str(limit): 0 for limit in COMPONENT_SIZE_BINS
+            },
         }
     ink = ink[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    component_sizes = _component_sizes(ink)
+    component_size_p10 = float(np.quantile(component_sizes, 0.10))
     return {
         "ink_pixels": int(ink.sum()),
         "ink_density": float(ink.mean()),
@@ -46,6 +63,11 @@ def raster_metrics(path: Path, *, threshold: int = 128) -> dict[str, float | int
         "enclosed_holes": _component_count(~ink, enclosed_only=True),
         "content_width": int(ink.shape[1]),
         "content_height": int(ink.shape[0]),
+        "component_size_p10": round(component_size_p10, 3),
+        "small_component_counts": {
+            str(limit): int((component_sizes <= limit).sum())
+            for limit in COMPONENT_SIZE_BINS
+        },
     }
 
 
@@ -68,6 +90,20 @@ def compare_rasters(
     ink_ratio = ratio("ink_pixels")
     component_ratio = ratio("ink_components")
     counter_retention = ratio("enclosed_holes")
+    baseline_component_p10 = float(baseline.get("component_size_p10") or 0.0)
+    eligible_limits = [
+        limit
+        for limit in COMPONENT_SIZE_BINS
+        if limit <= max(4.0, baseline_component_p10 * 0.8)
+    ]
+    tiny_component_threshold = max(eligible_limits, default=4)
+    baseline_tiny_components = int(
+        baseline["small_component_counts"][str(tiny_component_threshold)]
+    )
+    variant_tiny_components = int(
+        variant["small_component_counts"][str(tiny_component_threshold)]
+    )
+    tiny_component_excess = variant_tiny_components - baseline_tiny_components
     warnings = []
     if density_ratio < min_density_ratio:
         warnings.append("severe_ink_loss")
@@ -75,13 +111,24 @@ def compare_rasters(
         warnings.append("counter_loss_or_black_fill")
     if int(baseline["ink_components"]) >= 10 and component_ratio > max_component_ratio:
         warnings.append("stroke_fragmentation")
+    if (
+        tiny_component_excess >= 4
+        and variant_tiny_components
+        > max(baseline_tiny_components + 3, baseline_tiny_components * 1.5)
+    ):
+        warnings.append("tiny_component_excess")
     return {
+        "qc_version": RASTER_QC_VERSION,
         "automatic_pass": not warnings,
         "warnings": warnings,
         "ink_ratio": round(ink_ratio, 4),
         "ink_density_ratio": round(density_ratio, 4),
         "component_ratio": round(component_ratio, 4),
         "counter_retention": round(counter_retention, 4),
+        "tiny_component_threshold": tiny_component_threshold,
+        "baseline_tiny_components": baseline_tiny_components,
+        "variant_tiny_components": variant_tiny_components,
+        "tiny_component_excess": tiny_component_excess,
         "baseline": baseline,
         "variant": variant,
     }

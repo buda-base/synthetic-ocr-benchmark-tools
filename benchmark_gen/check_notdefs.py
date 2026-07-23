@@ -5,6 +5,7 @@ PROBE = "བོད་ཡིག། སྐྱེས་ཆེན། རྒྱལ་
 
 SKT_LIST_PATH = "skt_ok.lst"
 FONT_SIZES_ADJUSTED_PATH = "font_sizes_adjusted.csv"
+EXCLUDED_FONTS_PATH = "excluded_fonts.lst"
 
 def load_skt_ok_set(path=SKT_LIST_PATH):
     p = pathlib.Path(path)
@@ -17,6 +18,17 @@ def load_skt_ok_set(path=SKT_LIST_PATH):
             items.append(s)
     print(items)
     return set(items)
+
+
+def load_excluded_fonts(path=EXCLUDED_FONTS_PATH):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return set()
+    return {
+        line.strip()
+        for line in p.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 def load_font_sizes_adjusted(path=FONT_SIZES_ADJUSTED_PATH):
     """
@@ -78,6 +90,7 @@ def hb_has_notdef(font_path, face_index=""):
 def main(csv_in="digital_fonts.csv", csv_out="digital_fonts.filtered.csv"):
     skt_ok_set = load_skt_ok_set()
     font_sizes_map = load_font_sizes_adjusted()
+    excluded_fonts = load_excluded_fonts()
 
     kept, dropped = [], []
     with open(csv_in, encoding="utf-8") as f:
@@ -85,6 +98,10 @@ def main(csv_in="digital_fonts.csv", csv_out="digital_fonts.filtered.csv"):
             font_path = row["font_path"]
             face_index = row.get("ttc_face_index", "").strip()
             base = row["basename"].strip()
+            if base in excluded_fonts:
+                row["drop_reason"] = "manual benchmark exclusion"
+                dropped.append(row)
+                continue
 
             # Original coverage test
             bad, info = hb_has_notdef(font_path, face_index)
@@ -116,6 +133,7 @@ def main(csv_in="digital_fonts.csv", csv_out="digital_fonts.filtered.csv"):
             w.writerows(dropped)
 
     print(f"Kept {len(kept)} fonts, dropped {len(dropped)}.")
+    print(f"Applied {len(excluded_fonts)} manual exclusion(s) from {EXCLUDED_FONTS_PATH}.")
     if skt_ok_set:
         print(f"Added skt_ok from {SKT_LIST_PATH} ({len(skt_ok_set)} basenames).")
     else:

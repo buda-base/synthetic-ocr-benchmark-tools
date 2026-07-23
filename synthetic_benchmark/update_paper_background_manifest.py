@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
+from tqdm import tqdm
 
 from paper_backgrounds import DEFAULT_BACKGROUND_MANIFEST, classify_luminance
 
@@ -57,7 +58,8 @@ def main() -> None:
         }
 
     selected: list[dict[str, object]] = []
-    for path in sorted(item for item in originals_dir.iterdir() if item.is_file()):
+    paths = sorted(item for item in originals_dir.iterdir() if item.is_file())
+    for path in tqdm(paths, desc="Measure paper luminance", unit="image"):
         row = source_rows.get(path.name)
         if row is None:
             raise ValueError(f"Selected background is absent from review CSV: {path.name}")
