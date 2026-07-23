@@ -6,7 +6,7 @@ Most synthetic OCR pipelines vary fonts, then distort the rendered image. This p
 
 The goal is not to invent implausible Tibetan scripts. It is to get controlled variation in width, slant, and stroke contrast from a limited digital-font catalogue, while rejecting variants that stop looking like normal Tibetan.
 
-![Two Tibetan fonts with combined width, slant, and stroke variations](../synthetic_benchmark/out/font_augmentation_demo/font_augmentation_demo.jpg)
+![Two Tibetan fonts with combined width, slant, and stroke variations](assets/04-font-augmentation/overview.jpg)
 
 ---
 
@@ -35,9 +35,9 @@ This is different from merely choosing a bold or condensed face. Each variant pr
 
 Horizontal scaling gives each face condensed and expanded variants. Manual review suggests a useful range of **0.80–1.20×**: large enough to be visually meaningful without turning the letters into caricatures.
 
-The wide example below is still the same Aathup uchen face, at width `1.20`, slant `−10°`, with slightly thinned horizontal strokes:
+The small gallery below keeps the source face and text fixed. The first row is Aathup uchen; the second is GangJie Drutsa ume. Each moves from the original to narrow and wide combinations:
 
-![Wide Aathup variant](../synthetic_benchmark/out/font_augmentation_demo/png/Aathup__combo_5.png)
+![Original, narrow, and wide combined variants for one uchen and one ume font](assets/04-font-augmentation/examples.jpg)
 
 ### Slant
 
@@ -56,9 +56,7 @@ That distribution produces many subtle variants and only a small tail of strongl
 
 Changing stroke width independently in the two directions alters contrast in a way that simple scaling cannot. A font can have heavier horizontal strokes without becoming wider, or thinner vertical strokes without becoming shorter.
 
-Here is a narrow GangJie Drutsa ume sample with stronger horizontal strokes:
-
-![Narrow GangJie Drutsa with thicker horizontal strokes](../synthetic_benchmark/out/font_augmentation_demo/png/GangJie-Drutsa__combo_3.png)
+The lower middle and lower right cells above show the same ume face with stronger horizontal strokes and with both axes thickened.
 
 This axis is also the dangerous one. Too much thinning makes strokes disappear; too much thickening closes counters or merges layers in a stack. Our current conservative starting points are around `−0.010 em` horizontally and `−0.015 em` vertically for thinning, and up to `+0.030 em` for reviewed thickening. These are review-derived engineering priors, not yet measurements of the manuscript population.
 
@@ -75,7 +73,7 @@ Early experiments exposed exactly why font augmentation cannot be an unchecked r
 
 The audit sheet deliberately includes rejected boundary cases, outlined in red:
 
-![Directional-stroke audit sheet with automatically rejected cells](../synthetic_benchmark/out/font_augmentation_review/round4/contact_sheet.jpg)
+![Directional-stroke audit sheet with automatically rejected cells](assets/04-font-augmentation/qc_boundaries.jpg)
 
 We now compare every variant with its unmodified baseline at three levels.
 
@@ -128,4 +126,6 @@ The audit produces individual PNGs, a contact sheet, a JSON manifest, cached fon
 
 Code: [`font_augmentation.py`](../synthetic_benchmark/font_augmentation.py), [`skia_directional_stroke_worker.py`](../synthetic_benchmark/skia_directional_stroke_worker.py), [`font_augmentation_raster_qc.py`](../synthetic_benchmark/font_augmentation_raster_qc.py), and [`render_font_augmentation_audit.py`](../synthetic_benchmark/render_font_augmentation_audit.py).
 
-*Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · 4 · Font-space augmentation*
+*Next: [adding ink, paper, noise, folding, and blur after rasterization](05-image-augmentation.md).*
+
+*Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · 4 · Font-space augmentation · [5 · Image augmentation](05-image-augmentation.md)*

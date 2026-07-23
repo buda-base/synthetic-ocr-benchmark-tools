@@ -196,6 +196,61 @@ avoid new hard shaping failures on the Tibetan probe set, render successfully,
 and pass the ink-density/counter/component raster checks. Affine-sensitive
 placement heuristics remain part of manual review rather than the runtime gate.
 
+## 2c. Review ink, paper, noise, and local spatial augmentation
+
+Document-level augmentation is also kept outside dataset rendering until its
+strengths and probabilities have been reviewed. With Augraphy installed in the
+project environment, render the current mild/medium/strong grid with:
+
+```bash
+/home/eroux/pvenvs/1/bin/pip install augraphy
+/home/eroux/pvenvs/1/bin/python \
+  synthetic_benchmark/render_document_augmentation_audit.py
+```
+
+The default inputs are one Uchen and one Ume benchmark page. Outputs under
+`out/document_augmentation_review/` include full JPEG samples, a reproducibility
+manifest, and three contact sheets per source:
+
+- local ink: bleed-through, dirty drum, dithering, ink bleed, rare hollowing,
+  letterpress, and line degradation;
+- paper/photometric noise: paper color, low-light noise, noise texture, and
+  subtle noise;
+- local spatial/optical effects: InkShifter, folding, and Gaussian blur.
+
+Every row compares the source with mild, medium, and deliberately strong boundary
+values. The script downsizes only these review renders to 1400 px by default; use
+`--review-width 0` to inspect the original resolution. The strong column is not a
+proposed production distribution. In particular, hollowing, dithering, strong
+dirty-drum marks, strong low-light noise, and multi-fold samples are included to
+make rejection boundaries visible.
+
+The reviewed production policy is enabled explicitly during page rendering:
+
+```bash
+/home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_batches.py \
+  synthetic_benchmark/out/render_plan.parquet \
+  --out-dir synthetic_benchmark/out/dataset \
+  --document-augmentation \
+  --document-augmentation-rate 0.90 \
+  --jobs 4
+```
+
+Assignments are deterministic and balanced separately for each source font face:
+the closest integer to 90% of that font's planned images receives exactly one
+local appearance effect. The weighted pool favors subtle noise, noise texture,
+ink bleed, letterpress, and bleed-through. ColorPaper is rare, and Hollow is
+extremely rare and weaker than the review sheet. LowLightNoise and
+LinesDegradation are excluded: the latter targets long straight rules and table
+borders, so it had no meaningful target on the pecha pages.
+
+InkShifter (8%), folding (3%), and blur (10%) are assigned independently per
+font. Blur has only mild and medium levels. The full deterministic assignment is
+written to `OUT_DIR/document_augmentation_manifest.json` and per-image effects
+are retained in checkpoint/alignment metadata. Augmented runs save all pages as
+RGB JPEGs so the rare paper color is not discarded; runs without
+`--document-augmentation` retain the existing grayscale output.
+
 ## 3. Render Pecha JPEG/Alignment Pairs
 
 ```bash

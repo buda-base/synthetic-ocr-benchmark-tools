@@ -113,6 +113,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep generated temporary font files and QC renders for debugging.",
     )
+    parser.add_argument(
+        "--document-augmentation",
+        action="store_true",
+        help="Apply the reviewed deterministic ink/paper/noise policy after rasterization.",
+    )
+    parser.add_argument("--document-augmentation-rate", type=float, default=0.90)
+    parser.add_argument("--document-augmentation-seed", type=int, default=13)
+    parser.add_argument("--inkshifter-rate", type=float, default=0.08)
+    parser.add_argument("--folding-rate", type=float, default=0.03)
+    parser.add_argument("--blur-rate", type=float, default=0.10)
     parser.add_argument("--lualatex", default="lualatex")
     parser.add_argument("--pdftoppm", default="pdftoppm")
     parser.add_argument("--force", action="store_true")
@@ -745,6 +755,16 @@ def write_text_and_catalog(
                 "font_augmentation_source_face_index": (
                     row.get("font_augmentation_source_face_index") or ""
                 ),
+                "document_augmentation_local": row.get("document_augmentation_local") or "",
+                "document_augmentation_local_strength": (
+                    row.get("document_augmentation_local_strength") or ""
+                ),
+                "document_augmentation_spatial": row.get("document_augmentation_spatial") or "",
+                "document_augmentation_spatial_strength": (
+                    row.get("document_augmentation_spatial_strength") or ""
+                ),
+                "document_augmentation_blur": row.get("document_augmentation_blur") or "",
+                "document_augmentation_seed": row.get("document_augmentation_seed") or "",
             }
         )
     return next_output_id
@@ -932,9 +952,19 @@ def render_batch(
             output_ids.append(int(row.get("image_id") or next_output_id + i))
         except (TypeError, ValueError):
             output_ids.append(next_output_id + i)
-    for src, output_id in zip(rendered_pages, output_ids):
+    for src, output_id, row in zip(rendered_pages, output_ids, render_rows):
         dest = args.out_dir / benchmark_image_relpath(output_id)
-        save_grayscale_jpeg(src, dest, args.jpeg_quality)
+        if getattr(args, "document_augmentation", False):
+            from document_augmentation import apply_document_augmentations
+
+            apply_document_augmentations(
+                src,
+                dest,
+                row,
+                jpeg_quality=args.jpeg_quality,
+            )
+        else:
+            save_grayscale_jpeg(src, dest, args.jpeg_quality)
     next_output_id = write_text_and_catalog(
         render_rows,
         args.out_dir,
@@ -1203,6 +1233,15 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "suggested_split": row.get("suggested_split") or "",
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
                 "font_augmentation_specs": row.get("font_augmentation_specs") or "",
+                "document_augmentation_local": row.get("document_augmentation_local") or "",
+                "document_augmentation_local_strength": (
+                    row.get("document_augmentation_local_strength") or ""
+                ),
+                "document_augmentation_spatial": row.get("document_augmentation_spatial") or "",
+                "document_augmentation_spatial_strength": (
+                    row.get("document_augmentation_spatial_strength") or ""
+                ),
+                "document_augmentation_blur": row.get("document_augmentation_blur") or "",
             }
             for row in sorted(group_rows, key=catalog_sort_key)
         ]
@@ -1227,11 +1266,12 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "heuristics. A font/chunk pair was accepted only when every stack in the chunk was "
         "supported by that font. Decorative fonts were excluded.\n\n"
         "Pages were rendered with LuaLaTeX/fontspec using HarfBuzz, then rasterized as "
-        "grayscale JPEG images. The rendered transcription preserves line breaks recovered "
+        "JPEG images. Runs without document augmentation are grayscale; augmented runs are "
+        "stored as RGB so rare paper-color effects survive. The rendered transcription preserves line breaks recovered "
         "from LuaTeX line markers. The alignment parquet files contain page-to-text rows "
         "plus synthetic metadata: `font_name`, `script_8`, `etext_source`, "
         "`stack_difficulty_score`, `suggested_split`, and—when enabled—deterministic "
-        "`font_augmentation_id` and `font_augmentation_specs` values.\n\n"
+        "font and document augmentation fields.\n\n"
         "## Planning and Splits\n\n"
         "The render plan aims for a balanced distribution across the 8-way Tibetan script "
         "classification (`script_8`) while keeping image volumes pure with respect to "
@@ -1495,6 +1535,34 @@ def main() -> None:
     rows.sort(key=lambda row: int(row["image_id"]))
     if args.limit is not None:
         rows = rows[: args.limit]
+    if args.document_augmentation:
+        from document_augmentation import (
+            assign_document_augmentations,
+            write_document_augmentation_manifest,
+        )
+
+        if existing_catalog_rows and any(
+            "document_augmentation_local" not in row for row in existing_catalog_rows
+        ):
+            raise SystemExit(
+                "Cannot enable document augmentation while resuming checkpoints created "
+                "without augmentation metadata; use a new --out-dir or --force."
+            )
+        rows, document_manifest = assign_document_augmentations(
+            rows,
+            local_rate=args.document_augmentation_rate,
+            inkshifter_rate=args.inkshifter_rate,
+            folding_rate=args.folding_rate,
+            blur_rate=args.blur_rate,
+            seed=args.document_augmentation_seed,
+        )
+        document_manifest_path = args.out_dir / "document_augmentation_manifest.json"
+        write_document_augmentation_manifest(document_manifest_path, document_manifest)
+        print(
+            f"Document augmentation enabled: local effects on "
+            f"{args.document_augmentation_rate:.1%} of planned images per source font"
+        )
+        print(f"Wrote {document_manifest_path}")
     if existing_catalog_rows:
         before = len(rows)
         rows = filter_completed_plan_rows(rows, existing_catalog_rows, args.out_dir)
