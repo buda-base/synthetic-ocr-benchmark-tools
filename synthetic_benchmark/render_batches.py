@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a synthetic benchmark render plan as pecha-format JPEG/TXT pairs."""
+"""Render a synthetic benchmark plan as pecha-format image/TXT pairs."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from font_augmentation_runtime import DEFAULT_PROBES as DEFAULT_FONT_AUGMENTATION_PROBES
 from font_augmentation_runtime import prepare_font_variants
+from paper_backgrounds import DEFAULT_BACKGROUND_MANIFEST
 from shorthand_aug import (
     DEFAULT_DENYLIST_CSV,
     DEFAULT_SHORTHANDS_CSV,
@@ -69,8 +70,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--margin-x-mm", type=float, default=20.0)
     parser.add_argument("--margin-y-mm", type=float, default=16.0)
     parser.add_argument("--font-scale", type=float, default=1.5)
-    parser.add_argument("--jpeg-quality", type=int, default=80)
-    parser.add_argument("--image-width-px", type=int, default=2400)
+    parser.add_argument("--jpeg-quality", type=int, default=85)
+    parser.add_argument("--low-jpeg-quality", type=int, default=65)
+    parser.add_argument("--low-jpeg-quality-rate", type=float, default=0.10)
+    parser.add_argument("--raster-jpeg-quality", type=int, default=95)
+    parser.add_argument(
+        "--image-width-px",
+        type=int,
+        default=None,
+        help="Use one fixed output width instead of the default randomized range.",
+    )
+    parser.add_argument("--min-image-width-px", type=int, default=1800)
+    parser.add_argument("--max-image-width-px", type=int, default=3500)
+    parser.add_argument("--image-output-seed", type=int, default=13)
     parser.add_argument("--min-lines-per-image", type=int, default=5)
     parser.add_argument("--max-merge-passes", type=int, default=5)
     parser.add_argument("--page-prefix", default=PAGE_PREFIX)
@@ -120,6 +132,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--document-augmentation-rate", type=float, default=0.90)
     parser.add_argument("--document-augmentation-seed", type=int, default=13)
+    parser.add_argument(
+        "--paper-background-manifest",
+        type=Path,
+        default=DEFAULT_BACKGROUND_MANIFEST,
+    )
+    parser.add_argument(
+        "--paper-background-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "out" / "blank_paper_review" / "originals",
+        help="Optional local full-resolution background directory; missing files are cached from S3.",
+    )
+    parser.add_argument("--paper-background-rate", type=float, default=0.60)
+    parser.add_argument("--synthetic-paper-rate", type=float, default=0.30)
+    parser.add_argument("--paper-background-download-workers", type=int, default=16)
     parser.add_argument("--inkshifter-rate", type=float, default=0.08)
     parser.add_argument("--folding-rate", type=float, default=0.03)
     parser.add_argument("--blur-rate", type=float, default=0.10)
@@ -150,13 +176,15 @@ def ve_id_for_output(output_id: int) -> str:
     return f"{VE_ID_PREFIX}_{volume_number(output_id):04d}"
 
 
-def benchmark_image_relpath(output_id: int) -> Path:
+def benchmark_image_relpath(output_id: int, extension: str = ".jpg") -> Path:
+    if extension not in {".jpg", ".tif"}:
+        raise ValueError(f"Unsupported benchmark image extension: {extension}")
     return (
         Path("images")
         / W_ID
         / i_id_for_output(output_id)
         / VOLUME_VERSION
-        / f"{page_number_in_volume(output_id):04d}.jpg"
+        / f"{page_number_in_volume(output_id):04d}{extension}"
     )
 
 
@@ -667,10 +695,17 @@ def apply_shorthands_to_rows(
     return prepared
 
 
-def save_grayscale_jpeg(src: Path, dest: Path, quality: int) -> None:
+def save_grayscale_jpeg(src: Path, dest: Path, quality: int, width_px: int) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(src) as img:
-        img.convert("L").save(dest, "JPEG", quality=quality)
+        grayscale = img.convert("L")
+        if grayscale.width != width_px:
+            height_px = max(1, round(grayscale.height * width_px / grayscale.width))
+            grayscale = grayscale.resize(
+                (width_px, height_px),
+                Image.Resampling.LANCZOS,
+            )
+        grayscale.save(dest, "JPEG", quality=quality)
 
 
 def strip_transcription_line_edges(text: str) -> str:
@@ -692,7 +727,10 @@ def write_text_and_catalog(
         except (TypeError, ValueError):
             output_id = next_output_id
         next_output_id = max(next_output_id, output_id + 1)
-        image_relpath = benchmark_image_relpath(output_id)
+        image_relpath = benchmark_image_relpath(
+            output_id,
+            str(row.get("document_augmentation_output_extension") or ".jpg"),
+        )
         pages = pages_by_chunk.get(str(row["render_id"]), [])
         text_pages = content_pages(pages)
         first_page = (text_pages or pages or [{"physical_page": "", "line_count": ""}])[0]
@@ -720,6 +758,8 @@ def write_text_and_catalog(
                 "ve_version": VOLUME_VERSION,
                 "page_in_volume": page_number_in_volume(output_id),
                 "image_file_name": image_relpath.as_posix(),
+                "output_width_px": row.get("output_width_px") or "",
+                "output_jpeg_quality": row.get("output_jpeg_quality") or "",
                 "transcription": text,
                 "source_plan_image_ids": "|".join(row["_source_plan_image_ids"]),
                 "page_prefix_added": row.get("page_prefix_added", 0),
@@ -758,6 +798,30 @@ def write_text_and_catalog(
                 "font_augmentation_source_file": row.get("font_augmentation_source_file") or "",
                 "font_augmentation_source_face_index": (
                     row.get("font_augmentation_source_face_index") or ""
+                ),
+                "document_augmentation_paper_source": (
+                    row.get("document_augmentation_paper_source") or ""
+                ),
+                "document_augmentation_background_id": (
+                    row.get("document_augmentation_background_id") or ""
+                ),
+                "document_augmentation_background_uri": (
+                    row.get("document_augmentation_background_uri") or ""
+                ),
+                "document_augmentation_background_mode": (
+                    row.get("document_augmentation_background_mode") or ""
+                ),
+                "document_augmentation_paper_effect": (
+                    row.get("document_augmentation_paper_effect") or ""
+                ),
+                "document_augmentation_paper_strength": (
+                    row.get("document_augmentation_paper_strength") or ""
+                ),
+                "document_augmentation_output_mode": (
+                    row.get("document_augmentation_output_mode") or ""
+                ),
+                "document_augmentation_output_extension": (
+                    row.get("document_augmentation_output_extension") or ""
                 ),
                 "document_augmentation_local": row.get("document_augmentation_local") or "",
                 "document_augmentation_local_strength": (
@@ -940,10 +1004,10 @@ def render_batch(
             str(max(physical_pages)),
             "-jpeg",
             "-jpegopt",
-            f"quality={args.jpeg_quality}",
+            f"quality={args.raster_jpeg_quality}",
             "-gray",
             "-scale-to-x",
-            str(args.image_width_px),
+            str(args.raster_width_px),
             "-scale-to-y",
             "-1",
             str(pdf_path),
@@ -974,7 +1038,10 @@ def render_batch(
         except (TypeError, ValueError):
             output_ids.append(next_output_id + i)
     for src, output_id, row in zip(rendered_pages, output_ids, render_rows):
-        dest = args.out_dir / benchmark_image_relpath(output_id)
+        dest = args.out_dir / benchmark_image_relpath(
+            output_id,
+            str(row.get("document_augmentation_output_extension") or ".jpg"),
+        )
         if getattr(args, "document_augmentation", False):
             from document_augmentation import apply_document_augmentations
 
@@ -982,10 +1049,19 @@ def render_batch(
                 src,
                 dest,
                 row,
-                jpeg_quality=args.jpeg_quality,
+                jpeg_quality=int(row.get("output_jpeg_quality") or args.jpeg_quality),
             )
         else:
-            save_grayscale_jpeg(src, dest, args.jpeg_quality)
+            save_grayscale_jpeg(
+                src,
+                dest,
+                int(row.get("output_jpeg_quality") or args.jpeg_quality),
+                int(row.get("output_width_px") or args.raster_width_px),
+            )
+        for alternative_extension in (".jpg", ".tif"):
+            alternative = dest.with_suffix(alternative_extension)
+            if alternative != dest:
+                alternative.unlink(missing_ok=True)
     next_output_id = write_text_and_catalog(
         render_rows,
         args.out_dir,
@@ -1243,6 +1319,8 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "transcription": row["transcription"],
                 "dist_ocr": None,
                 "pagination": int(row["page_in_volume"]),
+                "output_width_px": int(row["output_width_px"]),
+                "output_jpeg_quality": int(row["output_jpeg_quality"]),
                 "font_name": row.get("font_name") or "",
                 "script_8": row.get("script_8") or "",
                 "etext_source": row.get("etext_source") or "",
@@ -1254,6 +1332,30 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "suggested_split": row.get("suggested_split") or "",
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
                 "font_augmentation_specs": row.get("font_augmentation_specs") or "",
+                "document_augmentation_paper_source": (
+                    row.get("document_augmentation_paper_source") or ""
+                ),
+                "document_augmentation_background_id": (
+                    row.get("document_augmentation_background_id") or ""
+                ),
+                "document_augmentation_background_uri": (
+                    row.get("document_augmentation_background_uri") or ""
+                ),
+                "document_augmentation_background_mode": (
+                    row.get("document_augmentation_background_mode") or ""
+                ),
+                "document_augmentation_paper_effect": (
+                    row.get("document_augmentation_paper_effect") or ""
+                ),
+                "document_augmentation_paper_strength": (
+                    row.get("document_augmentation_paper_strength") or ""
+                ),
+                "document_augmentation_output_mode": (
+                    row.get("document_augmentation_output_mode") or ""
+                ),
+                "document_augmentation_output_extension": (
+                    row.get("document_augmentation_output_extension") or ""
+                ),
                 "document_augmentation_local": row.get("document_augmentation_local") or "",
                 "document_augmentation_local_strength": (
                     row.get("document_augmentation_local_strength") or ""
@@ -1267,15 +1369,17 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     row.get("document_augmentation_rotation_strength") or ""
                 ),
                 "document_augmentation_rotation_deg": (
-                    row.get("document_augmentation_rotation_deg")
-                    if row.get("document_augmentation_rotation_deg") is not None
-                    else ""
+                    float(row["document_augmentation_rotation_deg"])
+                    if row.get("document_augmentation_rotation_deg") not in (None, "")
+                    else None
                 ),
                 "document_augmentation_tps_strength": (
                     row.get("document_augmentation_tps_strength") or ""
                 ),
                 "document_augmentation_tps_y_norm": (
-                    row.get("document_augmentation_tps_y_norm") or ""
+                    float(row["document_augmentation_tps_y_norm"])
+                    if row.get("document_augmentation_tps_y_norm") not in (None, "")
+                    else None
                 ),
                 "document_augmentation_tps_offsets_height": (
                     row.get("document_augmentation_tps_offsets_height") or ""
@@ -1304,8 +1408,11 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "heuristics. A font/chunk pair was accepted only when every stack in the chunk was "
         "supported by that font. Decorative fonts were excluded.\n\n"
         "Pages were rendered with LuaLaTeX/fontspec using HarfBuzz, then rasterized as "
-        "JPEG images. Runs without document augmentation are grayscale; augmented runs are "
-        "stored as RGB so rare paper-color effects survive. The rendered transcription preserves line breaks recovered "
+        "images at deterministic widths from 1800 to 3500 pixels. JPEG quality is 85, "
+        "except for a deterministic 10% subset at quality 65. Runs without document "
+        "augmentation use grayscale JPEG. Augmented pages "
+        "preserve their paper source: grayscale and RGB paper use matching JPEG modes, "
+        "while bilevel paper uses Group 4 TIFF. The rendered transcription preserves line breaks recovered "
         "from LuaTeX line markers. The alignment parquet files contain page-to-text rows "
         "plus synthetic metadata: `font_name`, `script_8`, `etext_source`, "
         "`stack_difficulty_score`, `suggested_split`, and—when enabled—deterministic "
@@ -1548,6 +1655,12 @@ def render_planned_rows(
 
 def main() -> None:
     args = parse_args()
+    if args.image_width_px is not None:
+        args.min_image_width_px = args.image_width_px
+        args.max_image_width_px = args.image_width_px
+    args.raster_width_px = args.max_image_width_px
+    if not 1 <= args.raster_jpeg_quality <= 100:
+        raise SystemExit("--raster-jpeg-quality must be in [1, 100]")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     load_shorthand_runtime(args)
     if args.force:
@@ -1573,22 +1686,35 @@ def main() -> None:
     rows.sort(key=lambda row: int(row["image_id"]))
     if args.limit is not None:
         rows = rows[: args.limit]
+    if existing_catalog_rows and any(
+        "output_width_px" not in row or "output_jpeg_quality" not in row
+        for row in existing_catalog_rows
+    ):
+        raise SystemExit(
+            "Cannot resume checkpoints created without randomized output-size/quality "
+            "metadata; use a new --out-dir or --force."
+        )
     if args.document_augmentation:
         from document_augmentation import (
             assign_document_augmentations,
             write_document_augmentation_manifest,
         )
+        from paper_backgrounds import load_paper_backgrounds
 
         if existing_catalog_rows and any(
-            "document_augmentation_rotation_deg" not in row for row in existing_catalog_rows
+            "document_augmentation_paper_source" not in row for row in existing_catalog_rows
         ):
             raise SystemExit(
                 "Cannot enable document augmentation while resuming checkpoints created "
-                "without augmentation metadata; use a new --out-dir or --force."
+                "without paper-background metadata; use a new --out-dir or --force."
             )
+        paper_backgrounds = load_paper_backgrounds(args.paper_background_manifest)
         rows, document_manifest = assign_document_augmentations(
             rows,
+            paper_backgrounds=paper_backgrounds,
             local_rate=args.document_augmentation_rate,
+            background_rate=args.paper_background_rate,
+            synthetic_paper_rate=args.synthetic_paper_rate,
             inkshifter_rate=args.inkshifter_rate,
             folding_rate=args.folding_rate,
             blur_rate=args.blur_rate,
@@ -1598,15 +1724,42 @@ def main() -> None:
             tps_high_rate=args.tps_high_rate,
             seed=args.document_augmentation_seed,
         )
+        document_manifest["paper_policy"]["manifest_path"] = str(
+            args.paper_background_manifest
+        )
         document_manifest_path = args.out_dir / "document_augmentation_manifest.json"
         write_document_augmentation_manifest(document_manifest_path, document_manifest)
         print(
-            f"Document augmentation enabled: local effects on "
+            f"Document augmentation enabled: real paper on "
+            f"{args.paper_background_rate:.1%}, synthetic paper on "
+            f"{args.synthetic_paper_rate:.1%}, local ink effects on "
             f"{args.document_augmentation_rate:.1%}, rotation on "
             f"{args.rotation_rate:.1%}, and TPS on {args.tps_rate:.1%} "
             f"of planned images per source font"
         )
         print(f"Wrote {document_manifest_path}")
+    from image_output_policy import assign_image_output_parameters
+
+    rows, image_output_manifest = assign_image_output_parameters(
+        rows,
+        min_width_px=args.min_image_width_px,
+        max_width_px=args.max_image_width_px,
+        jpeg_quality=args.jpeg_quality,
+        low_jpeg_quality=args.low_jpeg_quality,
+        low_jpeg_quality_rate=args.low_jpeg_quality_rate,
+        seed=args.image_output_seed,
+    )
+    image_output_manifest_path = args.out_dir / "image_output_manifest.json"
+    image_output_manifest_path.write_text(
+        json.dumps(image_output_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"Output widths assigned from {args.min_image_width_px} to "
+        f"{args.max_image_width_px}px; JPEG quality {args.jpeg_quality} with "
+        f"{args.low_jpeg_quality_rate:.1%} at quality {args.low_jpeg_quality}"
+    )
+    print(f"Wrote {image_output_manifest_path}")
     if existing_catalog_rows:
         before = len(rows)
         rows = filter_completed_plan_rows(rows, existing_catalog_rows, args.out_dir)
@@ -1619,6 +1772,24 @@ def main() -> None:
     augmentation_cache: Path | None = None
     rendering_finished = False
     try:
+        if args.document_augmentation:
+            from paper_backgrounds import prepare_paper_background_cache
+
+            resolved_backgrounds = prepare_paper_background_cache(
+                rows,
+                paper_backgrounds,
+                cache_dir=args.out_dir / ".paper_background_cache",
+                local_review_dir=(
+                    args.paper_background_dir
+                    if args.paper_background_dir.exists()
+                    else None
+                ),
+                workers=args.paper_background_download_workers,
+            )
+            print(
+                f"Resolved {len(resolved_backgrounds)} selected paper background(s) "
+                "for remaining render rows"
+            )
         if args.font_augmentation_variants:
             augmentation_cache = args.out_dir / ".font_augmentation_cache"
             rows, manifest = prepare_font_variants(

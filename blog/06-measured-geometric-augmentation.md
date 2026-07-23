@@ -98,4 +98,6 @@ The defaults are 70% rotation, 10% high rotation, 30% TPS, and 10% high TPS. The
 
 Implementation: [`document_augmentation.py`](../synthetic_benchmark/document_augmentation.py), integration and metadata: [`render_batches.py`](../synthetic_benchmark/render_batches.py), and reproducible samples: [`render_blog_augmentation_assets.py`](../synthetic_benchmark/render_blog_augmentation_assets.py).
 
-*Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · [4 · Font-space augmentation](04-font-space-augmentation.md) · [5 · Image augmentation](05-image-augmentation.md) · 6 · Measured geometry*
+*Next: [reviewed real-paper backgrounds and mode-aware output encoding](07-real-paper-backgrounds-and-output-encoding.md).*
+
+*Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · [4 · Font-space augmentation](04-font-space-augmentation.md) · [5 · Image augmentation](05-image-augmentation.md) · 6 · Measured geometry · [7 · Real paper and encoding](07-real-paper-backgrounds-and-output-encoding.md)*

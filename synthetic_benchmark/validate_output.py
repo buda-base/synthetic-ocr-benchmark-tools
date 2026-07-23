@@ -59,6 +59,9 @@ def main() -> None:
     widths = Counter()
     heights = Counter()
     modes = Counter()
+    formats = Counter()
+    compressions = Counter()
+    extensions = Counter(Path(str(row["img_file_name"])).suffix.lower() for row in rows)
     for row in rows[: args.sample_images]:
         image_path = (
             args.out_dir
@@ -74,6 +77,9 @@ def main() -> None:
             widths[img.width] += 1
             heights[img.height] += 1
             modes[img.mode] += 1
+            formats[str(img.format)] += 1
+            if img.format == "TIFF":
+                compressions[str(img.tag_v2.get(259))] += 1
 
     print(f"alignment rows: {len(rows)}")
     print(f"missing files: {len(missing)}")
@@ -83,6 +89,9 @@ def main() -> None:
     print(f"\nsampled widths: {dict(widths)}")
     print(f"sampled heights: {dict(heights)}")
     print(f"sampled modes: {dict(modes)}")
+    print(f"sampled formats: {dict(formats)}")
+    print(f"sampled TIFF compression tags: {dict(compressions)}")
+    print(f"all image extensions: {dict(extensions)}")
     print(f"\nalignment parquet files: {len(parquet_paths)}")
 
 

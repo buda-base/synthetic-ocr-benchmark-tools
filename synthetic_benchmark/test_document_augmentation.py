@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from document_augmentation import _apply_vertical_tps, assign_document_augmentations
+from document_augmentation import (
+    _apply_vertical_tps,
+    apply_document_augmentations,
+    assign_document_augmentations,
+)
+from paper_backgrounds import PaperBackground
 
 
 def sample_rows(fonts: int = 3, images_per_font: int = 20) -> list[dict[str, object]]:
@@ -28,9 +35,36 @@ def sample_rows(fonts: int = 3, images_per_font: int = 20) -> list[dict[str, obj
     return rows
 
 
+def sample_backgrounds() -> list[PaperBackground]:
+    return [
+        PaperBackground(
+            background_id=f"background-{mode}",
+            w_id="W1",
+            i_id="I1",
+            i_version="v1",
+            filename=f"paper-{mode}.tif",
+            source_s3_uri=f"s3://example/paper-{mode}.tif",
+            width=400,
+            height=100,
+            display_width=400,
+            display_height=100,
+            aspect_ratio=4.0,
+            exif_orientation=None,
+            pil_mode=mode,
+            size_bytes=100,
+        )
+        for mode in ("1", "L", "RGB")
+    ]
+
+
 class DocumentAugmentationPolicyTests(unittest.TestCase):
     def test_local_rate_is_balanced_per_font(self) -> None:
-        prepared, manifest = assign_document_augmentations(sample_rows(), local_rate=0.90, seed=13)
+        prepared, manifest = assign_document_augmentations(
+            sample_rows(),
+            paper_backgrounds=sample_backgrounds(),
+            local_rate=0.90,
+            seed=13,
+        )
         counts: Counter[str] = Counter()
         totals: Counter[str] = Counter()
         for row in prepared:
@@ -43,9 +77,22 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertTrue(all(font["local_rate"] == 0.9 for font in manifest["fonts"]))
 
     def test_policy_is_deterministic_and_excludes_removed_effects(self) -> None:
-        first, _manifest = assign_document_augmentations(sample_rows(images_per_font=100), seed=42)
-        second, _manifest = assign_document_augmentations(sample_rows(images_per_font=100), seed=42)
+        first, _manifest = assign_document_augmentations(
+            sample_rows(images_per_font=100),
+            paper_backgrounds=sample_backgrounds(),
+            seed=42,
+        )
+        second, _manifest = assign_document_augmentations(
+            sample_rows(images_per_font=100),
+            paper_backgrounds=sample_backgrounds(),
+            seed=42,
+        )
         fields = (
+            "document_augmentation_paper_source",
+            "document_augmentation_background_id",
+            "document_augmentation_paper_effect",
+            "document_augmentation_output_mode",
+            "document_augmentation_output_extension",
             "document_augmentation_local",
             "document_augmentation_local_strength",
             "document_augmentation_spatial",
@@ -72,6 +119,7 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
     def test_geometric_rates_are_balanced_per_font(self) -> None:
         prepared, manifest = assign_document_augmentations(
             sample_rows(images_per_font=100),
+            paper_backgrounds=sample_backgrounds(),
             rotation_rate=0.70,
             rotation_high_rate=0.10,
             tps_rate=0.30,
@@ -117,6 +165,33 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertEqual(manifest["requested_rates"]["tps"], 0.30)
         self.assertEqual(manifest["requested_rates"]["tps_high"], 0.10)
 
+    def test_paper_sources_are_exclusive_and_balanced_per_font(self) -> None:
+        prepared, manifest = assign_document_augmentations(
+            sample_rows(images_per_font=100),
+            paper_backgrounds=sample_backgrounds(),
+            background_rate=0.60,
+            synthetic_paper_rate=0.30,
+            seed=17,
+        )
+        for font_index in range(3):
+            font_rows = [row for row in prepared if row["basename"] == f"Font{font_index}"]
+            counts = Counter(
+                str(row["document_augmentation_paper_source"]) for row in font_rows
+            )
+            self.assertEqual(counts, Counter({"real": 60, "synthetic": 30, "clean": 10}))
+            for row in font_rows:
+                source = row["document_augmentation_paper_source"]
+                if source == "real":
+                    self.assertTrue(row["document_augmentation_background_id"])
+                    self.assertFalse(row["document_augmentation_paper_effect"])
+                elif source == "synthetic":
+                    self.assertFalse(row["document_augmentation_background_id"])
+                    self.assertTrue(row["document_augmentation_paper_effect"])
+                else:
+                    self.assertFalse(row["document_augmentation_background_id"])
+                    self.assertFalse(row["document_augmentation_paper_effect"])
+        self.assertEqual(manifest["requested_rates"]["clean_paper"], 0.10)
+
     def test_vertical_tps_preserves_dimensions_and_changes_pixels(self) -> None:
         image = np.full((120, 300, 3), 255, dtype=np.uint8)
         image[58:63, 20:280] = 0
@@ -132,15 +207,61 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             assign_document_augmentations(
                 sample_rows(),
+                paper_backgrounds=sample_backgrounds(),
                 rotation_rate=0.10,
                 rotation_high_rate=0.20,
             )
         with self.assertRaises(ValueError):
             assign_document_augmentations(
                 sample_rows(),
+                paper_backgrounds=sample_backgrounds(),
                 tps_rate=0.10,
                 tps_high_rate=0.20,
             )
+
+    def test_real_background_mode_and_encoding_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.png"
+            source_image = np.full((100, 400), 255, dtype=np.uint8)
+            source_image[40:60, 100:300] = 0
+            Image.fromarray(source_image).save(source)
+
+            cases = (
+                ("L", 210, ".jpg", "JPEG"),
+                ("RGB", (210, 220, 230), ".jpg", "JPEG"),
+                ("1", 255, ".tif", "TIFF"),
+            )
+            for mode, color, extension, image_format in cases:
+                background = root / f"background-{mode}.tif"
+                Image.new(mode, (800, 200), color=color).save(background)
+                destination = root / f"output-{mode}{extension}"
+                row = {
+                    "document_augmentation_seed": 13,
+                    "document_augmentation_local": "",
+                    "document_augmentation_local_strength": "",
+                    "document_augmentation_spatial": "",
+                    "document_augmentation_spatial_strength": "",
+                    "document_augmentation_paper_source": "real",
+                    "document_augmentation_background_mode": mode,
+                    "_document_augmentation_background_path": str(background),
+                    "document_augmentation_output_mode": mode,
+                    "document_augmentation_tps_strength": "",
+                    "document_augmentation_rotation_deg": "",
+                    "document_augmentation_blur": "",
+                }
+                apply_document_augmentations(
+                    source,
+                    destination,
+                    row,
+                    jpeg_quality=95,
+                )
+                with Image.open(destination) as output:
+                    self.assertEqual(output.mode, mode)
+                    self.assertEqual(output.format, image_format)
+                    if mode == "1":
+                        self.assertEqual(output.tag_v2.get(259), 4)
+                    self.assertEqual(output.getpixel((200, 50)), 0 if mode != "RGB" else (0, 0, 0))
 
 
 if __name__ == "__main__":

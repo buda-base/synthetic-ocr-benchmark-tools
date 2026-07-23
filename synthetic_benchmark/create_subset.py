@@ -218,7 +218,7 @@ def write_readme(subset_root: Path, subset_id: str, split_counts: dict[str, int]
         "generated from the [OpenPecha BoCorpus](https://huggingface.co/datasets/openpecha/BoCorpus) "
         "and the fonts/code in the [OpenPecha Tibetan Fonts repository](https://github.com/openpecha/tibetan-fonts).\n\n"
         "## Contents\n\n"
-        "Each row contains JPEG `image_bytes`, the rendered Tibetan transcription, routing "
+        "Each row contains JPEG or Group 4 TIFF `image_bytes`, the rendered Tibetan transcription, routing "
         "metadata (`mw_id`, `mode`, `line_breaks`, `access`, `technology`, `script`), and "
         "synthetic metadata (`pagination`, `font_name`, `script_8`, `etext_source`, "
         "`stack_difficulty_score`, `suggested_split`). The subset is sharded by split in "
@@ -227,8 +227,9 @@ def write_readme(subset_root: Path, subset_id: str, split_counts: dict[str, int]
         "BoCorpus text was normalized, chunked into page-sized passages, and tokenized into "
         "Tibetan stacks. Candidate font/chunk pairs were filtered using font-specific stack "
         "support data from HarfBuzz shaping and conservative geometric placement checks. "
-        "Accepted pages were rendered with LuaLaTeX/fontspec using HarfBuzz and rasterized "
-        "as grayscale JPEGs. Transcriptions preserve rendered line breaks.\n\n"
+        "Accepted pages were rendered with LuaLaTeX/fontspec using HarfBuzz. Grayscale and "
+        "RGB paper is stored as JPEG; bilevel paper is stored as Group 4 TIFF. "
+        "Transcriptions preserve rendered line breaks.\n\n"
         "## Splits\n\n"
         "Splits are taken from the benchmark alignment metadata. The planning process aims "
         "to balance `script_8`, keep `uchen` and `ume` in separate image volumes, and avoid "
@@ -263,7 +264,7 @@ def write_subset_info(
         for split in sorted(shard_paths)
     }
     info = {
-        "description": "Full synthetic BoCorpus Tibetan OCR benchmark subset with embedded JPEG image bytes.",
+        "description": "Full synthetic BoCorpus Tibetan OCR benchmark subset with embedded JPEG/TIFF image bytes.",
         "creation_date": date.today().isoformat(),
         "author": author,
         "nb_images": nb_images,

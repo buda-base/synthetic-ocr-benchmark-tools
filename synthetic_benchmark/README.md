@@ -16,7 +16,11 @@ out/dataset/
   checkpoints/catalog_batches/
 ```
 
-Images are rendered as grayscale JPEGs with quality 80 and width 2400 px. The page shape is pecha-like by default: width is four times height.
+Image widths are deterministically randomized from 1800 to 3500 px. JPEG quality
+is 85 by default, with 10% of JPEG pages at quality 65. Clean pages use grayscale
+JPEG; augmented pages can also use RGB JPEG or bilevel Group 4 TIFF according to
+their paper background. The page shape is pecha-like by default: width is four
+times height.
 
 ## Inputs
 
@@ -237,10 +241,16 @@ The reviewed production policy is enabled explicitly during page rendering:
 ```
 
 Assignments are deterministic and balanced separately for each source font face:
-the closest integer to 90% of that font's planned images receives exactly one
-local appearance effect. The weighted pool favors subtle noise, noise texture,
-ink bleed, letterpress, and bleed-through. ColorPaper is rare, and Hollow is
-extremely rare and weaker than the review sheet. LowLightNoise and
+60% use one of the manually selected real paper backgrounds, 30% use synthetic
+paper color or page noise, and 10% remain clean white. These three paper sources
+are exclusive. The selected source list is committed in
+`data/paper_backgrounds.csv`; local files are used when available, otherwise
+assigned sources are cached from S3.
+
+Independently, the closest integer to 90% of each font's planned images receives
+exactly one ink appearance effect. The weighted pool includes ink bleed,
+letterpress, bleed-through, dirty drum, dithering, and rare weak Hollow.
+Paper color and page noise are not applied to real-background pages. LowLightNoise and
 LinesDegradation are excluded: the latter targets long straight rules and table
 borders, so it had no meaningful target on the pecha pages.
 
@@ -263,10 +273,16 @@ cannot exceed their corresponding total rates.
 The full deterministic assignment is written to
 `OUT_DIR/document_augmentation_manifest.json`, and per-image effects and
 geometric parameters are retained in checkpoint/alignment metadata. Augmented
-runs save all pages as RGB JPEGs so the rare paper color is not discarded; runs
-without `--document-augmentation` retain the existing grayscale output.
+runs preserve the selected paper mode: grayscale and RGB backgrounds are
+written as matching JPEG modes, while bilevel backgrounds are written as Group
+4 TIFF. Runs without `--document-augmentation` retain grayscale JPEG output.
+Output widths and JPEG quality are recorded per image and summarized in
+`OUT_DIR/image_output_manifest.json`. Use `--image-width-px` for a fixed-width
+run, or override the range and low-quality share with
+`--min-image-width-px`, `--max-image-width-px`, and
+`--low-jpeg-quality-rate`.
 
-## 3. Render Pecha JPEG/Alignment Pairs
+## 3. Render Pecha Image/Alignment Pairs
 
 ```bash
 /home/eroux/pvenvs/1/bin/python synthetic_benchmark/render_batches.py \
@@ -296,10 +312,15 @@ Only shorthands whose stacks are supported by the paired font (and not denyliste
 The renderer groups pages by font into multi-page LuaLaTeX batches, then rasterizes with:
 
 ```text
-pdftoppm -jpeg -jpegopt quality=80 -gray -scale-to-x 2400 -scale-to-y -1
+pdftoppm -jpeg -jpegopt quality=95 -gray -scale-to-x 3500 -scale-to-y -1
 ```
 
-The final JPEGs are explicitly converted to grayscale (`L`) before being written.
+Without document augmentation, final JPEGs are explicitly converted to grayscale
+(`L`). Each page is resized to its assigned 1800–3500 px width before final
+encoding. With augmentation, the intermediate starts on white and ink is composited
+onto the selected real, synthetic, or clean paper before TPS, rotation, and blur.
+Real backgrounds are stretched to the exact output dimensions rather than
+cropped when their aspect ratio differs.
 
 Pecha page defaults:
 
