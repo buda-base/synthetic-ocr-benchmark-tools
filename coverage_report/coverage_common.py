@@ -37,6 +37,11 @@ TSA_PHRU = "\u0f39"
 # Relative-x shift (vs the same stack without tsa-phru) that means U+0F39
 # disturbed another mark's placement. Tuned on shorthand-pass review.
 TSA_PHRU_MARK_SHIFT_THRESHOLD = 0.30
+# Letters whose glyph already includes a tsa-phru tick (ཙ ཚ ཛ / ྩ ྪ ྫ).
+# A ra-go / top mark nesting into that tick is normal, not a merge failure.
+TSA_PHRU_BASE_LETTERS = frozenset("\u0f59\u0f5a\u0f5b")  # ཙ ཚ ཛ
+TSA_PHRU_SUBJOINED_LETTERS = frozenset("\u0fa9\u0faa\u0fab")  # ྩ ྪ ྫ
+TSA_PHRU_LETTERS = TSA_PHRU_BASE_LETTERS | TSA_PHRU_SUBJOINED_LETTERS
 
 TIBETAN_BASE_LETTER_RANGES = ((0x0F40, 0x0F6C),)
 TIBETAN_SUBJOINED_RANGES = ((0x0F90, 0x0FBC),)
@@ -688,6 +693,8 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
         warnings.append("top_mark_horizontal_misalignment")
     if detect_mark_horizontal_misalignment(text, glyph_boxes):
         warnings.append("mark_horizontal_misalignment")
+    if detect_superscript_merge(text, glyph_boxes):
+        warnings.append("superscript_merge")
 
     if has_bottom_vowel(text):
         # The bottom-vowel glyph is usually one of the final glyphs, but top
@@ -714,15 +721,20 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
             )
             overlap = min(bottom_top, previous_top) - max(bottom_bottom, previous_bottom)
             bottom_height = bottom_top - bottom_bottom
+            # Positive when the vowel hangs below the previous layer. Normal
+            # āchung / zhabs-kyu attachment overlaps the previous glyph but still
+            # protrudes; only treat as absorbed/inside when it barely hangs.
+            bottom_extends = previous_bottom - bottom_bottom
             bottom_absorbed = (
                 bottom_height > 0
                 and overlap / bottom_height >= 0.85
-                and bottom_bottom > previous_bottom - 0.08 * stack_height
+                and bottom_extends < 0.08 * stack_height
             )
             bottom_inside_previous = (
                 bottom_height > 0
                 and overlap / bottom_height >= 0.45
                 and bottom_top > previous_bottom + 0.20 * bottom_height
+                and bottom_extends < 0.20 * bottom_height
             )
             if (
                 bottom_top > previous_top - min_layer_gap
@@ -1093,36 +1105,83 @@ def detect_top_diacritic_collision(text: str, glyph_boxes: list[dict[str, object
     return x_spread <= 0.08 * avg_width and y_spread <= 0.08 * avg_height
 
 
+def _top_mark_attachment_letter(text: str) -> str | None:
+    """Last base/subjoined letter before trailing top marks.
+
+    Bottom vowels between the letter and the top-mark run (e.g. ཚུཾ) are
+    skipped so the attachment consonant is ཚ, not ུ.
+    """
+    if not text or text[-1] not in TOP_MARKS:
+        return None
+    i = len(text) - 1
+    while i >= 0 and text[i] in TOP_MARKS:
+        i -= 1
+    while i >= 0 and text[i] in BOTTOM_VOWELS:
+        i -= 1
+    if i < 0:
+        return None
+    return text[i]
+
+
 def detect_top_mark_overlap(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
     """Flag top marks colliding with / swallowed by the preceding body glyph.
 
     Motivating false positive from shorthand-pass review (2026-07-22):
     - AmdoClassic4 / tshuM (ཚུཾ): anusvara mostly inside the tsha+u composite
+
+    Simple consonant + naro / gigu (e.g. Monlam Lakdi ཚོ) must not fail: those
+    marks sit on the head bar, so their ink boxes overlap the letter bbox even
+    when placement is correct. Only flag when the mark does not reach the head.
+
+    Exception: ཙ / ཚ / ཛ / ྩ / ྪ / ྫ already include a tsa-phru tick, so a
+    *single* top mark nesting into that tick is expected when it still reaches
+    the **base** head (same rationale as ``superscript_merge``). Mid-body marks
+    (KhaWa ``ཛྫཱཾ``) and multi-mark pile-ups (``ཚོཾ``, ``ཛིི``) still fail —
+    audit 2026-07-23.
     """
     top_mark_count = sum(1 for ch in text if ch in TOP_MARKS)
     if top_mark_count < 1 or text[-1:] not in TOP_MARKS or len(glyph_boxes) < 2:
         return False
 
     last = glyph_boxes[-1]
+    # Inherent tsa-phru: allow one mark into the tick only if it still reaches
+    # near the base head. Compare against glyph_boxes[0], not the previous glyph
+    # (which may be āchung sitting far below).
+    if (
+        top_mark_count == 1
+        and _top_mark_attachment_letter(text) in TSA_PHRU_LETTERS
+    ):
+        base = glyph_boxes[0]
+        base_top = int(base["ytop"])
+        base_height = base_top - int(base["ybot"])
+        if base_height > 0 and int(last["ytop"]) >= base_top - 0.15 * base_height:
+            return False
     previous = glyph_boxes[-2]
     last_top = int(last["ytop"])
     last_bottom = int(last["ybot"])
     previous_top = int(previous["ytop"])
     previous_bottom = int(previous["ybot"])
+    previous_height = previous_top - previous_bottom
     last_height = last_top - last_bottom
-    if last_height <= 0:
+    if last_height <= 0 or previous_height <= 0:
         return False
 
     overlap = min(last_top, previous_top) - max(last_bottom, previous_bottom)
     overlap_ratio = overlap / last_height if overlap > 0 else 0
 
     # Top marks should sit above the preceding body/stack glyph. If a separate
-    # top mark is mostly inside that preceding glyph's vertical span, it is
-    # colliding with a top vowel/mark already present in the composite glyph.
+    # top mark is mostly inside that preceding glyph's vertical span *and* does
+    # not reach the head line, it is colliding with / swallowed by the body.
     #
     # Threshold 0.60 (was 0.65). Motivating false positive from shorthand-pass
     # review (2026-07-22): AmdoClassic4 / tshuM (ཚུཾ), overlap ratio ~0.645.
-    if overlap_ratio >= 0.60 and last_bottom < previous_top:
+    # Head-reaching marks (Monlam Lakdi ཚོ naro on tsha) are allowed.
+    reaches_head = last_top >= previous_top - 0.02 * previous_height
+    if (
+        not reaches_head
+        and overlap_ratio >= 0.60
+        and last_bottom < previous_top
+    ):
         return True
 
     for body in glyph_boxes[:-1]:
@@ -1318,6 +1377,81 @@ def detect_subscript_containment(text: str, glyph_boxes: list[dict[str, object]]
     return False
 
 
+def _is_bottom_vowel_glyph_name(name: object) -> bool:
+    text = str(name or "").lower()
+    return any(
+        key in text
+        for key in (
+            "shapkyu",
+            "shabkyu",
+            "achung",
+            "0f71",
+            "0f74",
+            "0f75",
+            "zhabs",
+            "a-chung",
+            "_-a",
+            "uni0f71",
+            "uni0f74",
+        )
+    )
+
+
+def detect_superscript_merge(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
+    """Flag a separate ra-go / superscript glyph merged into the next letter's head.
+
+    Motivating false positive from blog/audit review (2026-07-23):
+    - Monlam_Lakdi_Ouchen / རྒྦྷྱཱ: ``tibRaGo4`` mostly inside ``tib_Ga4`` head
+      (overlap ~0.71 of ra-go height, only ~0.29 protruding above ga).
+
+    Precomposed ra-go ligatures (single glyph for རྒ) are out of scope here.
+
+    Exception: ྩ / ྪ / ྫ already carry a tsa-phru tick, so a ra-go (or other
+    top attachment) nesting into that tick is expected — do not flag
+    རྩ / རྪ / རྫ style stacks as merge failures.
+    """
+    if len(glyph_boxes) < 2 or not text:
+        return False
+    # ra (U+0F62) followed by a subjoined letter
+    if text[0] != "\u0F62":
+        return False
+    if len(text) < 2 or not ("\u0F90" <= text[1] <= "\u0FBC"):
+        return False
+    # Inherent tsa-phru on ྩ ྪ ྫ: merge into the tick is fine.
+    if text[1] in TSA_PHRU_SUBJOINED_LETTERS:
+        return False
+
+    rago = glyph_boxes[0]
+    base = glyph_boxes[1]
+    name = str(rago.get("name") or "").lower()
+    # Prefer explicit ra-go glyph names from split stacks (tibRaGo*, tibtStack4Rg).
+    # Skip precomposed ra+base ligatures and unrelated leading glyphs.
+    looks_like_rago = (
+        "rago" in name
+        or "ra_go" in name
+        or "stack4rg" in name
+        or "stack3rg" in name
+        or name.endswith("rg")
+        or ".rg" in name
+    )
+    if not looks_like_rago:
+        return False
+
+    rago_top = int(rago["ytop"])
+    rago_bottom = int(rago["ybot"])
+    base_top = int(base["ytop"])
+    base_bottom = int(base["ybot"])
+    rago_height = rago_top - rago_bottom
+    if rago_height <= 0:
+        return False
+    overlap = min(rago_top, base_top) - max(rago_bottom, base_bottom)
+    if overlap <= 0:
+        return False
+    overlap_ratio = overlap / rago_height
+    protrude_ratio = (rago_top - base_top) / rago_height
+    return overlap_ratio >= 0.55 and protrude_ratio <= 0.40
+
+
 def detect_subscript_overlap(text: str, glyph_boxes: list[dict[str, object]]) -> bool:
     metrics = stack_metrics(text)
     if int(metrics["subjoined_count"]) < 2 or len(glyph_boxes) < 3:
@@ -1326,6 +1460,10 @@ def detect_subscript_overlap(text: str, glyph_boxes: list[dict[str, object]]) ->
     trailing_top_marks = trailing_top_mark_glyph_count(text, glyph_boxes)
     end_idx = len(glyph_boxes) - trailing_top_marks
     stack_boxes = glyph_boxes[:end_idx]
+    # Bottom vowels often nest into the previous layer by design; do not treat
+    # that attachment as a collapsed subscript pair (Monlam Lakdi ཀྵྞུ).
+    while stack_boxes and _is_bottom_vowel_glyph_name(stack_boxes[-1].get("name")):
+        stack_boxes = stack_boxes[:-1]
     if len(stack_boxes) < 2:
         return False
 
@@ -1333,6 +1471,8 @@ def detect_subscript_overlap(text: str, glyph_boxes: list[dict[str, object]]) ->
     # later layer spends a large share of its height inside the previous layer,
     # it still appears collapsed rather than stacked.
     for previous, current in zip(stack_boxes, stack_boxes[1:]):
+        if _is_bottom_vowel_glyph_name(current.get("name")):
+            continue
         current_top = int(current["ytop"])
         current_bottom = int(current["ybot"])
         previous_top = int(previous["ytop"])

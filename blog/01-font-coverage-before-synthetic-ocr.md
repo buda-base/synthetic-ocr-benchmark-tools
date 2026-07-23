@@ -54,17 +54,17 @@ Deep stacks that still resolve into readable layers — all faces below are cata
 
 | Font | Catalog type | Stack | Why it matters |
 |------|--------------|-------|----------------|
-| Monlam Lakdi Ouchen | Uchen · Zabma | རྒྦྷྱཱ | Multi-layer *ba* / *ha* / *ya* under *ra-go*, with *āchung* |
+| Qomolangma Subtitle | Uchen · Zabma | རྒྦྷྱཱ | Same deep SKT stack with a clean, separate *ra-go* |
 | Qomolangma Uchen Suring | Uchen · Zabma | རྐྵྱཱ | *kṣa*-type conjuncts that many faces still get wrong |
 | DDC Uchen | Uchen · Zabma | དྡྷྭེ | Ligated body + top vowel |
 | Tendar Ouchen | Uchen · Zabma | མྔྦྱཾ | Deep stack + *anusvāra* |
-| Jamyang Monlam Uchen | Uchen · Zabma | ནྱྲྲྲྲྲཾ | Stress test: repeated *ra* layers |
+| Thonmi Tradition Uchen Nye | Uchen · Zabma | ནྡྷྱཱཾ | Tall *ddha* / *ya* stack with *āchung* + *anusvāra* |
 | Monlam Lakdi Ouchen | Uchen · Zabma | ཀྵྨྼྻུཾ | Very tall SKT stack still descending cleanly |
 
 <p>
-<img src="assets/01-coverage/pass_Monlam_Lakdi_Ouchen_9d98a1a9.png" alt="Monlam Lakdi Ouchen rendering རྒྦྷྱཱ" height="180"/>
+<img src="assets/01-coverage/pass_close_qomo_rgbhya.png" alt="Qomolangma Subtitle rendering with clean ra-go" height="180"/>
 &nbsp;
-<img src="assets/01-coverage/pass_Qomolangma-UchenSuring_6265a2c7.png" alt="Qomolangma Uchen Suring rendering རྐྵྱཱ" height="180"/>
+<img src="assets/01-coverage/pass_Qomolangma-UchenSuring_6265a2c7.png" alt="Qomolangma Uchen Suring rendering" height="180"/>
 </p>
 
 Ume faces that also clear the long SKT tail look different on the page, but the coverage question is the same. A few high-coverage ume passes on བྷྲཱུྃ:
@@ -79,28 +79,29 @@ Ume faces that also clear the long SKT tail look different on the page, but the 
 
 ### Failures (uchen)
 
-Same uchen fonts, stacks where shaping “succeeds” but the ink is wrong — or where the engine admits defeat with a dotted circle:
+Stacks where shaping “succeeds” but the ink is wrong — or where the engine admits defeat:
 
 ![Gallery of failed renders flagged by placement heuristics](assets/01-coverage/fail_gallery.jpg)
 
 | Rule | Font | Stack | What you see |
 |------|------|-------|--------------|
-| `floating_bottom_vowel` | Monlam Lakdi Ouchen | ཛཱ | *āchung* does not sit under the body |
-| `top_mark_overlap` | Monlam Lakdi Ouchen | ཚོ | *naro* collides with / is swallowed by the head |
+| `superscript_merge` | Monlam Lakdi Ouchen | རྒྦྷྱཱ | *Ra-go* merged into the *ga* head (same stack Qomolangma draws cleanly) |
+| `top_mark_overlap` | DDC Uchen | ཧྲཽཾ | Top marks collide / get swallowed |
 | `subscript_overlap` | DDC Uchen | རྑྷཾ | Layers crush into each other |
-| `subscript_containment` | DDC Uchen | བྷྲ྄ཱུྃ | A “subscript” drawn entirely inside the previous glyph |
-| `top_diacritic_collision` | Monlam Lakdi Ouchen | བཾཾ | Repeated top marks pile on the same spot |
-| `dotted_circle` | Monlam Lakdi Ouchen | ༹ | Mark never attaches; U+25CC appears |
+| `subscript_containment` | DDC Uchen | བྷྲ྄ཱུྃ | A “subscript” drawn inside the previous glyph |
+| `mid_stem` | DDC Uchen | ཀོུ༹ | *Zhabs kyu* hangs mid-stem after *tsa-phru* |
+| `tsa_phru_mark_shift` | Amdo Classic 2 | རྡེུ༹ | *Tsa-phru* shoves other marks sideways |
+| `missing_base_letter` | Kokonor | ོུ༹ཾ | Mark-only stack; no base letter |
 
 <p>
-<img src="assets/01-coverage/fail_Monlam_Lakdi_Ouchen_6a3a4152.png" alt="top_mark_overlap on ཚོ" height="120"/>
+<img src="assets/01-coverage/fail_Monlam_Lakdi_Ouchen_9d98a1a9.png" alt="superscript_merge ra-go into ga on Monlam Lakdi" height="160"/>
 &nbsp;
-<img src="assets/01-coverage/fail_Ddc_uchen_51c13124.png" alt="subscript_overlap on རྑྷཾ" height="120"/>
+<img src="assets/01-coverage/fail_Ddc_uchen_51c13124.png" alt="subscript_overlap on DDC Uchen" height="120"/>
 &nbsp;
-<img src="assets/01-coverage/fail_Monlam_Lakdi_Ouchen_ecfdebfd.png" alt="dotted_circle on ༹" height="120"/>
+<img src="assets/01-coverage/fail_Kokonor_d6c3c71e.png" alt="missing_base_letter on Kokonor" height="120"/>
 </p>
 
-That last class is the honest failure. The dangerous ones are the middle rows: HarfBuzz returned glyphs, nothing was `.notdef`, and a naïve “shaped OK” check would have green-lit a page that no human would accept as uchen.
+The dangerous ones are not `.notdef` tofu: HarfBuzz returned glyphs, and a naïve “shaped OK” check would have green-lit a page that no human would accept as uchen.
 
 ---
 
@@ -134,7 +135,7 @@ Geometry / placement failures (bounding-box heuristics on the shaped glyphs):
 | `subscript_insufficient_descent` | Next layer does not start lower |
 | `subscript_layer_collision` | ≥4 subscripts jammed into the same vertical band |
 
-The newer rules (`mid_stem`, `tsa_phru_*`, `bottom_vowel_horizontal_misalignment`, `missing_base_letter`) came out of shorthand-pass visual review: fonts that look fine on ordinary BoCorpus stacks still break once *tsa-phru* and packed vowel clusters from abbreviation lists show up.
+The newer rules (`mid_stem`, `tsa_phru_*`, `bottom_vowel_horizontal_misalignment`, `missing_base_letter`, `superscript_merge`) came out of visual review (including shorthand-pass audits): fonts that look fine on ordinary BoCorpus stacks still break once *tsa-phru* and packed vowel clusters from abbreviation lists show up.
 
 ![New placement / hard-fail rules from shorthand review](assets/01-coverage/new_rules_gallery.jpg)
 

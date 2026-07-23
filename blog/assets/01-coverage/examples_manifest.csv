@@ -1,0 +1,15 @@
+image,kind,basename,stack,note,ok,reason
+pass_Qomolangma-Subtitle_dddb637c.png,pass,Qomolangma-Subtitle,རྒྦྷྱཱ,"same SKT stack, clean ra-go",True,ok
+pass_Qomolangma-UchenSuring_6265a2c7.png,pass,Qomolangma-UchenSuring,རྐྵྱཱ,ksya + ya + achung,True,ok
+pass_Ddc_uchen_2490496f.png,pass,Ddc_uchen,དྡྷྭེ,ddhwa + e,True,ok
+pass_Tendar_Ouchen_74a92f47.png,pass,Tendar_Ouchen,མྔྦྱཾ,deep stack + anusvara,True,ok
+pass_Thonmi_Tradition_Uchen_Nye_Style_9663f642.png,pass,Thonmi_Tradition_Uchen_Nye_Style,ནྡྷྱཱཾ,ndhya + achung + anusvara,True,ok
+pass_Monlam_Lakdi_Ouchen_5cd62a94.png,pass,Monlam_Lakdi_Ouchen,ཀྵྨྼྻུཾ,very tall SKT stack,True,ok
+fail_Monlam_Lakdi_Ouchen_9d98a1a9.png,fail,Monlam_Lakdi_Ouchen,རྒྦྷྱཱ,superscript_merge ra-go into ga,False,superscript_merge
+fail_Ddc_uchen_4d71b9bc.png,fail,Ddc_uchen,ཧྲཽཾ,top_mark_overlap,False,top_mark_overlap
+fail_Ddc_uchen_51c13124.png,fail,Ddc_uchen,རྑྷཾ,subscript_overlap,False,subscript_overlap
+fail_Ddc_uchen_2913e2a2.png,fail,Ddc_uchen,བྷྲ྄ཱུྃ,subscript_containment,False,bottom_vowel_horizontal_misalignment;subscript_containment
+fail_Ddc_uchen_369d8e88.png,fail,Ddc_uchen,ཀོུ༹,mid_stem,False,mid_stem
+fail_AmdoClassic2_6847d593.png,fail,AmdoClassic2,རྡེུ༹,tsa_phru_mark_shift,False,tsa_phru_mark_shift
+fail_Kokonor_d6c3c71e.png,fail,Kokonor,ོུ༹ཾ,missing_base_letter,False,missing_base_letter;bottom_vowel_horizontal_misalignment;tsa_phru_mark_shift
+fail_Font_af7fa990.png,fail,Font,མ༹ཾ,tsa_phru_too_low,False,tsa_phru_too_low
