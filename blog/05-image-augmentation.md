@@ -181,4 +181,6 @@ python synthetic_benchmark/render_batches.py \
 
 It can be combined with `--font-augmentation-variants 20` and `--enable-shorthands`. Code: [`document_augmentation.py`](../synthetic_benchmark/document_augmentation.py), [`render_document_augmentation_audit.py`](../synthetic_benchmark/render_document_augmentation_audit.py), and the integration in [`render_batches.py`](../synthetic_benchmark/render_batches.py).
 
+*Next: [measuring real rotation and line curvature before synthesizing page geometry](06-measured-geometric-augmentation.md).*
+
 *Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · [4 · Font-space augmentation](04-font-space-augmentation.md) · 5 · Image augmentation*

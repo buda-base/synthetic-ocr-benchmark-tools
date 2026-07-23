@@ -245,11 +245,26 @@ LinesDegradation are excluded: the latter targets long straight rules and table
 borders, so it had no meaningful target on the pecha pages.
 
 InkShifter (8%), folding (3%), and blur (10%) are assigned independently per
-font. Blur has only mild and medium levels. The full deterministic assignment is
-written to `OUT_DIR/document_augmentation_manifest.json` and per-image effects
-are retained in checkpoint/alignment metadata. Augmented runs save all pages as
-RGB JPEGs so the rare paper color is not discarded; runs without
-`--document-augmentation` retain the existing grayscale output.
+font. Blur has only mild and medium levels. Geometric augmentation assigns
+rotation to 70% of each font's pages: 60% use the typical central range up to
+about 0.9 degrees, and 10% use the broader empirical tail from 0.9 to 2.4
+degrees. TPS baseline curvature is applied to 30% of pages, all selected from
+the rotated pages to retain the relationship seen in ldv1. Of all pages, 20%
+use typical maximum vertical displacement up to 3.04% of image height and 10%
+use the stronger 3.04–5.26% range.
+
+TPS uses five correlated vertical-only control points at the empirical
+horizontal positions, plus four fixed identity corner anchors for stable page
+edges. The sampled corner anchors are not treated as distortion values.
+Override the defaults with `--rotation-rate`, `--rotation-high-rate`,
+`--tps-rate`, and `--tps-high-rate`; high rates are shares of all images and
+cannot exceed their corresponding total rates.
+
+The full deterministic assignment is written to
+`OUT_DIR/document_augmentation_manifest.json`, and per-image effects and
+geometric parameters are retained in checkpoint/alignment metadata. Augmented
+runs save all pages as RGB JPEGs so the rare paper color is not discarded; runs
+without `--document-augmentation` retain the existing grayscale output.
 
 ## 3. Render Pecha JPEG/Alignment Pairs
 

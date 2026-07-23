@@ -169,6 +169,11 @@ def build_combined_asset() -> None:
         # The source JPEG already contains its assigned local appearance effect.
         apply_row["document_augmentation_local"] = ""
         apply_row["document_augmentation_local_strength"] = ""
+        apply_row["document_augmentation_rotation_strength"] = ""
+        apply_row["document_augmentation_rotation_deg"] = ""
+        apply_row["document_augmentation_tps_strength"] = ""
+        apply_row["document_augmentation_tps_y_norm"] = ""
+        apply_row["document_augmentation_tps_offsets_height"] = ""
         apply_row["document_augmentation_spatial"] = spatial
         apply_row["document_augmentation_spatial_strength"] = spatial_strength
         apply_row["document_augmentation_blur"] = blur
@@ -187,10 +192,64 @@ def build_combined_asset() -> None:
         )
 
 
+def build_part6_assets() -> None:
+    from document_augmentation import apply_document_augmentations
+
+    source = REPO_ROOT / "blog" / "assets" / "02-rendering" / "pecha_uchen_example.jpg"
+    full_dir = OUT_DIR / "blog_part6_geometry_full"
+    destination = BLOG_ASSETS / "06-geometric-augmentation"
+    cases = (
+        {
+            "name": "rotation_weak",
+            "rotation_deg": 0.55,
+            "rotation_strength": "typical",
+        },
+        {
+            "name": "rotation_strong",
+            "rotation_deg": -1.80,
+            "rotation_strength": "high",
+        },
+        {
+            "name": "tps_rotation_weak",
+            "rotation_deg": 0.40,
+            "rotation_strength": "typical",
+            "tps_strength": "typical",
+            "tps_y_norm": 0.50,
+            "tps_offsets": "-0.02000000|0.01000000|0.02500000|0.00500000|-0.02000000",
+        },
+        {
+            "name": "tps_rotation_strong",
+            "rotation_deg": -1.20,
+            "rotation_strength": "high",
+            "tps_strength": "high",
+            "tps_y_norm": 0.50,
+            "tps_offsets": "-0.04500000|0.02000000|0.04000000|0.01500000|-0.03000000",
+        },
+    )
+    for index, case in enumerate(cases):
+        row = {
+            "document_augmentation_seed": 6000 + index,
+            "document_augmentation_local": "",
+            "document_augmentation_local_strength": "",
+            "document_augmentation_spatial": "",
+            "document_augmentation_spatial_strength": "",
+            "document_augmentation_blur": "",
+            "document_augmentation_rotation_deg": case["rotation_deg"],
+            "document_augmentation_rotation_strength": case["rotation_strength"],
+            "document_augmentation_tps_strength": case.get("tps_strength", ""),
+            "document_augmentation_tps_y_norm": case.get("tps_y_norm", ""),
+            "document_augmentation_tps_offsets_height": case.get("tps_offsets", ""),
+        }
+        full_image = full_dir / f"{case['name']}.jpg"
+        apply_document_augmentations(source, full_image, row, jpeg_quality=94)
+        crop_center_square(full_image, destination / f"{case['name']}.jpg")
+
+
 def main() -> None:
     build_part4_assets()
     build_part5_type_assets()
     build_combined_asset()
+    build_part6_assets()
     print(f"Wrote blog assets under {BLOG_ASSETS}")
 
 

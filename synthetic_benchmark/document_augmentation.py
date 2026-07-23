@@ -50,6 +50,21 @@ STRENGTH_WEIGHTS = {
     "hollow_rare": (("mild", 1.0),),
 }
 DOCUMENT_AUGMENTATION_LOCK = threading.Lock()
+TPS_X_NORMALIZED = np.asarray(
+    [0.0833757316, 0.2767441956, 0.5082266718, 0.7219677239, 0.9150948801],
+    dtype=np.float64,
+)
+TPS_SHAPE_COVARIANCE = np.asarray(
+    [
+        [0.000427648, 0.000063214, -0.000186558, -0.000201829, -0.000100111],
+        [0.000063214, 0.000144754, 0.000081550, -0.000061410, -0.000226010],
+        [-0.000186558, 0.000081550, 0.000223369, 0.000074149, -0.000190991],
+        [-0.000201829, -0.000061410, 0.000074149, 0.000127497, 0.000062748],
+        [-0.000100111, -0.000226010, -0.000190991, 0.000062748, 0.000455582],
+    ],
+    dtype=np.float64,
+)
+TPS_REGULARIZATION = 0.5
 
 
 def _stable_seed(seed: int, *values: object) -> int:
@@ -80,6 +95,52 @@ def _balanced_selection(
     return set(indices[:count])
 
 
+def _balanced_subselection(
+    rows: list[dict[str, object]],
+    candidates: set[int],
+    rate_of_all: float,
+    *,
+    seed: int,
+    label: str,
+) -> set[int]:
+    count = min(len(candidates), max(0, round(len(rows) * rate_of_all)))
+    indices = sorted(candidates)
+    random.Random(_stable_seed(seed, label)).shuffle(indices)
+    return set(indices[:count])
+
+
+def _sample_rotation_angle(rng: random.Random, strength: str) -> float:
+    if strength == "high":
+        magnitude = rng.triangular(0.90, 2.40, 1.15)
+        return magnitude if rng.random() < 0.5 else -magnitude
+    while True:
+        angle = rng.gauss(0.0, 0.55)
+        if -0.90 <= angle <= 0.90:
+            return angle
+
+
+def _sample_tps_parameters(seed: int, strength: str) -> tuple[float, list[float]]:
+    rng = random.Random(seed)
+    np_rng = np.random.default_rng(seed)
+    offsets = np_rng.multivariate_normal(
+        np.zeros(len(TPS_X_NORMALIZED)),
+        TPS_SHAPE_COVARIANCE,
+        check_valid="raise",
+    )
+    offsets -= offsets.mean()
+    maximum = float(np.max(np.abs(offsets)))
+    if maximum < 1e-9:
+        offsets = np.asarray([-1.0, 0.3, 0.8, 0.2, -0.3], dtype=np.float64)
+        maximum = 1.0
+    if strength == "high":
+        target_maximum = rng.triangular(0.0304, 0.0526, 0.0408)
+    else:
+        target_maximum = rng.triangular(0.0117, 0.0304, 0.0217)
+    offsets *= target_maximum / maximum
+    y_normalized = 0.10 + 0.80 * rng.betavariate(2.3, 2.3)
+    return y_normalized, offsets.tolist()
+
+
 def assign_document_augmentations(
     rows: list[dict[str, object]],
     *,
@@ -87,6 +148,10 @@ def assign_document_augmentations(
     inkshifter_rate: float = 0.08,
     folding_rate: float = 0.03,
     blur_rate: float = 0.10,
+    rotation_rate: float = 0.70,
+    rotation_high_rate: float = 0.10,
+    tps_rate: float = 0.30,
+    tps_high_rate: float = 0.10,
     seed: int = 13,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Assign exact per-font counts and deterministic effect choices."""
@@ -95,9 +160,19 @@ def assign_document_augmentations(
         ("inkshifter_rate", inkshifter_rate),
         ("folding_rate", folding_rate),
         ("blur_rate", blur_rate),
+        ("rotation_rate", rotation_rate),
+        ("rotation_high_rate", rotation_high_rate),
+        ("tps_rate", tps_rate),
+        ("tps_high_rate", tps_high_rate),
     ):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must be in [0, 1], got {value}")
+    if rotation_high_rate > rotation_rate:
+        raise ValueError("rotation_high_rate cannot exceed rotation_rate")
+    if tps_high_rate > tps_rate:
+        raise ValueError("tps_high_rate cannot exceed tps_rate")
+    if tps_rate > rotation_rate:
+        raise ValueError("tps_rate cannot exceed rotation_rate because TPS is assigned to rotated pages")
 
     groups: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
@@ -119,6 +194,30 @@ def assign_document_augmentations(
         )
         folding_indices = {folding_candidates[i] for i in folding_selected}
         blur_indices = _balanced_selection(font_rows, blur_rate, seed=font_seed, label="blur")
+        rotation_indices = _balanced_selection(
+            font_rows, rotation_rate, seed=font_seed, label="rotation"
+        )
+        rotation_high_indices = _balanced_subselection(
+            font_rows,
+            rotation_indices,
+            rotation_high_rate,
+            seed=font_seed,
+            label="rotation_high",
+        )
+        tps_indices = _balanced_subselection(
+            font_rows,
+            rotation_indices,
+            tps_rate,
+            seed=font_seed,
+            label="tps",
+        )
+        tps_high_indices = _balanced_subselection(
+            font_rows,
+            tps_indices,
+            tps_high_rate,
+            seed=font_seed,
+            label="tps_high",
+        )
         local_counts: Counter[str] = Counter()
 
         for index, row in enumerate(font_rows):
@@ -162,6 +261,35 @@ def assign_document_augmentations(
                 )
             else:
                 item["document_augmentation_blur"] = ""
+
+            if index in rotation_indices:
+                rotation_strength = "high" if index in rotation_high_indices else "typical"
+                rotation_rng = random.Random(
+                    _stable_seed(font_seed, row["image_id"], "rotation_parameters")
+                )
+                item["document_augmentation_rotation_strength"] = rotation_strength
+                item["document_augmentation_rotation_deg"] = round(
+                    _sample_rotation_angle(rotation_rng, rotation_strength), 6
+                )
+            else:
+                item["document_augmentation_rotation_strength"] = ""
+                item["document_augmentation_rotation_deg"] = ""
+
+            if index in tps_indices:
+                tps_strength = "high" if index in tps_high_indices else "typical"
+                tps_y, tps_offsets = _sample_tps_parameters(
+                    _stable_seed(font_seed, row["image_id"], "tps_parameters"),
+                    tps_strength,
+                )
+                item["document_augmentation_tps_strength"] = tps_strength
+                item["document_augmentation_tps_y_norm"] = round(tps_y, 6)
+                item["document_augmentation_tps_offsets_height"] = "|".join(
+                    f"{offset:.8f}" for offset in tps_offsets
+                )
+            else:
+                item["document_augmentation_tps_strength"] = ""
+                item["document_augmentation_tps_y_norm"] = ""
+                item["document_augmentation_tps_offsets_height"] = ""
             prepared.append(item)
 
         font_summaries.append(
@@ -174,6 +302,10 @@ def assign_document_augmentations(
                 "inkshifter_images": len(ink_indices),
                 "folding_images": len(folding_indices),
                 "blur_images": len(blur_indices),
+                "rotation_images": len(rotation_indices),
+                "rotation_high_images": len(rotation_high_indices),
+                "tps_images": len(tps_indices),
+                "tps_high_images": len(tps_high_indices),
                 "local_distribution": dict(sorted(local_counts.items())),
             }
         )
@@ -185,8 +317,23 @@ def assign_document_augmentations(
             "inkshifter": inkshifter_rate,
             "folding": folding_rate,
             "blur": blur_rate,
+            "rotation": rotation_rate,
+            "rotation_high": rotation_high_rate,
+            "tps": tps_rate,
+            "tps_high": tps_high_rate,
         },
         "local_effect_weights": dict(LOCAL_EFFECT_WEIGHTS),
+        "geometric_policy": {
+            "rate_interpretation": "high rates are shares of all images, not of augmented images",
+            "tps_is_subset_of_rotation": True,
+            "rotation_typical_range_deg": [-0.90, 0.90],
+            "rotation_high_magnitude_range_deg": [0.90, 2.40],
+            "tps_typical_max_displacement_height": [0.0117, 0.0304],
+            "tps_high_max_displacement_height": [0.0304, 0.0526],
+            "tps_x_normalized": TPS_X_NORMALIZED.tolist(),
+            "tps_regularization": TPS_REGULARIZATION,
+            "tps_corner_anchors": "four fixed identity image corners",
+        },
         "fonts": font_summaries,
     }
 
@@ -289,6 +436,55 @@ def _effect(name: str, strength: str):
         raise ValueError(f"Unsupported document augmentation: {name}/{strength}") from exc
 
 
+def _apply_vertical_tps(
+    image: np.ndarray,
+    *,
+    y_normalized: float,
+    offsets_height: list[float],
+) -> np.ndarray:
+    if len(offsets_height) != len(TPS_X_NORMALIZED):
+        raise ValueError(
+            f"Expected {len(TPS_X_NORMALIZED)} TPS offsets, got {len(offsets_height)}"
+        )
+    height, width = image.shape[:2]
+    ideal = np.column_stack(
+        (
+            TPS_X_NORMALIZED * (width - 1),
+            np.full(len(TPS_X_NORMALIZED), y_normalized * (height - 1)),
+        )
+    )
+    observed = ideal.copy()
+    observed[:, 1] += np.asarray(offsets_height, dtype=np.float64) * height
+    corners = np.asarray(
+        [[0, 0], [width - 1, 0], [0, height - 1], [width - 1, height - 1]],
+        dtype=np.float64,
+    )
+    ideal = np.concatenate((ideal, corners)).astype(np.float32)[None, :, :]
+    observed = np.concatenate((observed, corners)).astype(np.float32)[None, :, :]
+    matches = [cv2.DMatch(index, index, 0) for index in range(ideal.shape[1])]
+    transformer = cv2.createThinPlateSplineShapeTransformer(TPS_REGULARIZATION)
+    transformer.estimateTransformation(observed, ideal, matches)
+    return transformer.warpImage(
+        image,
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
+
+
+def _apply_rotation(image: np.ndarray, angle_deg: float) -> np.ndarray:
+    height, width = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D(((width - 1) / 2, (height - 1) / 2), angle_deg, 1.0)
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
+
+
 def apply_document_augmentations(
     source: Path,
     destination: Path,
@@ -315,6 +511,22 @@ def apply_document_augmentations(
             strength = str(row.get(strength_key) or "")
             if name:
                 image = _effect(name, strength)(image, force=True)
+
+        tps_strength = str(row.get("document_augmentation_tps_strength") or "")
+        if tps_strength:
+            offsets = [
+                float(value)
+                for value in str(row["document_augmentation_tps_offsets_height"]).split("|")
+            ]
+            image = _apply_vertical_tps(
+                image,
+                y_normalized=float(row["document_augmentation_tps_y_norm"]),
+                offsets_height=offsets,
+            )
+
+        rotation = row.get("document_augmentation_rotation_deg")
+        if rotation not in (None, ""):
+            image = _apply_rotation(image, float(rotation))
 
         blur = str(row.get("document_augmentation_blur") or "")
         if blur:

@@ -123,6 +123,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inkshifter-rate", type=float, default=0.08)
     parser.add_argument("--folding-rate", type=float, default=0.03)
     parser.add_argument("--blur-rate", type=float, default=0.10)
+    parser.add_argument("--rotation-rate", type=float, default=0.70)
+    parser.add_argument("--rotation-high-rate", type=float, default=0.10)
+    parser.add_argument("--tps-rate", type=float, default=0.30)
+    parser.add_argument("--tps-high-rate", type=float, default=0.10)
     parser.add_argument("--lualatex", default="lualatex")
     parser.add_argument("--pdftoppm", default="pdftoppm")
     parser.add_argument("--force", action="store_true")
@@ -764,6 +768,23 @@ def write_text_and_catalog(
                     row.get("document_augmentation_spatial_strength") or ""
                 ),
                 "document_augmentation_blur": row.get("document_augmentation_blur") or "",
+                "document_augmentation_rotation_strength": (
+                    row.get("document_augmentation_rotation_strength") or ""
+                ),
+                "document_augmentation_rotation_deg": (
+                    row.get("document_augmentation_rotation_deg")
+                    if row.get("document_augmentation_rotation_deg") is not None
+                    else ""
+                ),
+                "document_augmentation_tps_strength": (
+                    row.get("document_augmentation_tps_strength") or ""
+                ),
+                "document_augmentation_tps_y_norm": (
+                    row.get("document_augmentation_tps_y_norm") or ""
+                ),
+                "document_augmentation_tps_offsets_height": (
+                    row.get("document_augmentation_tps_offsets_height") or ""
+                ),
                 "document_augmentation_seed": row.get("document_augmentation_seed") or "",
             }
         )
@@ -1242,6 +1263,23 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     row.get("document_augmentation_spatial_strength") or ""
                 ),
                 "document_augmentation_blur": row.get("document_augmentation_blur") or "",
+                "document_augmentation_rotation_strength": (
+                    row.get("document_augmentation_rotation_strength") or ""
+                ),
+                "document_augmentation_rotation_deg": (
+                    row.get("document_augmentation_rotation_deg")
+                    if row.get("document_augmentation_rotation_deg") is not None
+                    else ""
+                ),
+                "document_augmentation_tps_strength": (
+                    row.get("document_augmentation_tps_strength") or ""
+                ),
+                "document_augmentation_tps_y_norm": (
+                    row.get("document_augmentation_tps_y_norm") or ""
+                ),
+                "document_augmentation_tps_offsets_height": (
+                    row.get("document_augmentation_tps_offsets_height") or ""
+                ),
             }
             for row in sorted(group_rows, key=catalog_sort_key)
         ]
@@ -1542,7 +1580,7 @@ def main() -> None:
         )
 
         if existing_catalog_rows and any(
-            "document_augmentation_local" not in row for row in existing_catalog_rows
+            "document_augmentation_rotation_deg" not in row for row in existing_catalog_rows
         ):
             raise SystemExit(
                 "Cannot enable document augmentation while resuming checkpoints created "
@@ -1554,13 +1592,19 @@ def main() -> None:
             inkshifter_rate=args.inkshifter_rate,
             folding_rate=args.folding_rate,
             blur_rate=args.blur_rate,
+            rotation_rate=args.rotation_rate,
+            rotation_high_rate=args.rotation_high_rate,
+            tps_rate=args.tps_rate,
+            tps_high_rate=args.tps_high_rate,
             seed=args.document_augmentation_seed,
         )
         document_manifest_path = args.out_dir / "document_augmentation_manifest.json"
         write_document_augmentation_manifest(document_manifest_path, document_manifest)
         print(
             f"Document augmentation enabled: local effects on "
-            f"{args.document_augmentation_rate:.1%} of planned images per source font"
+            f"{args.document_augmentation_rate:.1%}, rotation on "
+            f"{args.rotation_rate:.1%}, and TPS on {args.tps_rate:.1%} "
+            f"of planned images per source font"
         )
         print(f"Wrote {document_manifest_path}")
     if existing_catalog_rows:
