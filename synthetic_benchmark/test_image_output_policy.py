@@ -11,6 +11,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from image_output_policy import assign_image_output_parameters
+from page_layout_policy import assign_page_layout_parameters
 from paper_backgrounds import crop_resize_background
 
 
@@ -75,6 +76,42 @@ class ImageOutputPolicyTests(unittest.TestCase):
             self.assertEqual(output.size, (400, 100))
             self.assertEqual(output.getpixel((200, 10)), (255, 0, 0))
             self.assertEqual(output.getpixel((200, 90)), (0, 0, 255))
+
+    def test_line_spacing_varies_deterministically_within_safe_range(self) -> None:
+        rows = sample_rows(images_per_font=30)
+        first, manifest = assign_page_layout_parameters(rows, seed=29)
+        second, _manifest = assign_page_layout_parameters(rows, seed=29)
+        first_values = [row["layout_line_spacing_factor"] for row in first]
+        self.assertEqual(first, second)
+        self.assertTrue(all(1.18 <= value <= 1.32 for value in first_values))
+        self.assertGreater(len(set(first_values)), 50)
+        self.assertEqual(
+            Counter(row["layout_density_tier"] for row in first),
+            Counter({"condensed": 54, "sparse": 6}),
+        )
+        self.assertTrue(
+            all(
+                1.20 <= row["layout_font_scale_multiplier"] <= 1.35
+                for row in first
+                if row["layout_density_tier"] == "sparse"
+            )
+        )
+        self.assertEqual(
+            manifest["collision_policy"]["method"],
+            "stack-height-aware leading plus LuaTeX glyph-offset safety",
+        )
+
+    def test_tall_stacks_receive_extra_leading_only_on_their_pages(self) -> None:
+        rows = sample_rows(images_per_font=1)
+        rows[0]["stacks"] = "ཀ abcdefg"
+        rows[1]["stacks"] = "ཀ ཁ"
+        prepared, _manifest = assign_page_layout_parameters(rows, seed=29)
+        tall = prepared[0]
+        ordinary = prepared[1]
+        self.assertEqual(tall["layout_max_stack_codepoints"], 7)
+        self.assertEqual(tall["layout_stack_spacing_extra"], 0.9)
+        self.assertGreater(tall["layout_line_spacing_factor"], 2.0)
+        self.assertEqual(ordinary["layout_stack_spacing_extra"], 0.0)
 
 
 if __name__ == "__main__":

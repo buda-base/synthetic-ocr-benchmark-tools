@@ -17,7 +17,7 @@ BoCorpus chunks
     → render_batches.py
          LuaLaTeX / fontspec / HarfBuzz
          → PDF pages
-         → pdftoppm (grayscale JPEG, width 2400 px)
+         → pdftoppm (mixed JPEG/TIFF, width 1800–3500 px)
          → alignment parquet (transcription with real line breaks)
 ```
 
@@ -33,7 +33,13 @@ We need the same OpenType Tibetan shaping that HarfBuzz used in the coverage gat
 - per-syllable markers so we can rebuild the ground-truth text with the **same** line breaks the PDF produced
 - batching many pages per font in one TeX run
 
-Defaults look like a digital pecha strip: height 74 mm, width 296 mm, ~20 mm side margins, font size scaled from the catalog’s `font_size_pt`. Every other exported page can get a `༄༅། །` prefix, matching common volume openings.
+Defaults look like a digital pecha strip: height 74 mm, width 296 mm, ~20 mm
+side margins, and font size at `0.65 ×` the catalog’s normalized
+`font_size_pt`. This keeps 90% of pages reasonably condensed; a deterministic
+10% sparse subset receives a `1.20–1.35×` size multiplier. Variable leading and
+extra clearance for tall stacks add independent density variation.
+Every other exported page can get a `༄༅། །` prefix, matching common volume
+openings.
 
 ![Uchen page crop (Aathup)](assets/02-rendering/uchen_none_crop.jpg)
 
@@ -44,6 +50,22 @@ Defaults look like a digital pecha strip: height 74 mm, width 296 mm, ~20 mm sid
 ## What a render plan row is
 
 Each row is roughly: *one intended image* = one BoCorpus chunk + one font face + split label (train/val/test) + script taxonomy fields. The planner balances volume across the catalog’s `8 categories` (Zabma, Parma, Druma, Tsugma, …) while keeping uchen and ume volumes planned separately for later training mixes.
+
+Source text is balanced independently for every font face, before shorthand or
+other text augmentation:
+
+- **50% normal:** compatible prose chunks containing no stacks above the corpus
+  rarity threshold;
+- **50% difficult:** compatible chunks prioritizing rare stacks and broader
+  difficult-stack coverage.
+
+Some fonts cannot render enough globally rare stacks to fill their difficult
+half. In that case, the planner uses the most structurally complex compatible
+common chunks for that font instead. The policy tier, actual rarity tier, and
+fallback basis are recorded separately in
+`source_text_difficulty_tier`, `source_text_rarity_tier`, and
+`source_text_difficulty_basis`. Counts can differ by one when a font receives an
+odd number of pages.
 
 At render time, chunks that overflow a physical page contribute only their **first** page to the benchmark; short underfull pages can be merged with the next chunk and re-rendered. Failures are logged per batch; successful batches checkpoint so long runs are resumable.
 

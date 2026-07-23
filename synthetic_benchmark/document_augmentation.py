@@ -146,6 +146,72 @@ def _sample_tps_parameters(seed: int, strength: str) -> tuple[float, list[float]
     return y_normalized, offsets.tolist()
 
 
+def _allowed_background_tiers(
+    row: dict[str, object],
+    *,
+    font_scale: float,
+    local_effect: str,
+) -> tuple[set[str], float]:
+    rendered_font_size = (
+        float(row.get("font_size_pt") or 24.0)
+        * font_scale
+        * float(row.get("layout_font_scale_multiplier") or 1.0)
+    )
+    output_width = int(row.get("output_width_px") or 3500)
+    effective_text_scale = rendered_font_size * output_width
+    if local_effect in {"letterpress", "hollow_rare"} or effective_text_scale < 36_000:
+        return {"light"}, effective_text_scale
+    if effective_text_scale < 50_000:
+        return {"light", "medium"}, effective_text_scale
+    return {"light", "medium", "dark"}, effective_text_scale
+
+
+def _select_background(
+    backgrounds: list[PaperBackground],
+    *,
+    seed: int,
+) -> PaperBackground:
+    if not backgrounds:
+        raise ValueError("No compatible paper backgrounds are available")
+    return backgrounds[seed % len(backgrounds)]
+
+
+def enforce_background_readability_for_line_count(
+    row: dict[str, object],
+    line_count: int,
+) -> bool:
+    """Replace unexpectedly dark/dense pairings with a light same-mode fallback."""
+    if str(row.get("document_augmentation_paper_source") or "") != "real":
+        return False
+    tier = str(row.get("document_augmentation_background_luminance_tier") or "")
+    needs_fallback = (tier == "dark" and line_count >= 7) or (
+        tier == "medium" and line_count >= 8
+    )
+    if not needs_fallback or not row.get("_document_augmentation_fallback_background_id"):
+        row["document_augmentation_background_readability_fallback"] = 0
+        return False
+    row["document_augmentation_background_id"] = row[
+        "_document_augmentation_fallback_background_id"
+    ]
+    row["document_augmentation_background_uri"] = row[
+        "_document_augmentation_fallback_background_uri"
+    ]
+    row["document_augmentation_background_mode"] = row[
+        "_document_augmentation_fallback_background_mode"
+    ]
+    row["document_augmentation_background_luminance_tier"] = row[
+        "_document_augmentation_fallback_background_luminance_tier"
+    ]
+    row["document_augmentation_background_mean_luminance"] = row[
+        "_document_augmentation_fallback_background_mean_luminance"
+    ]
+    row["_document_augmentation_background_path"] = row[
+        "_document_augmentation_fallback_background_path"
+    ]
+    row["document_augmentation_background_readability_fallback"] = 1
+    return True
+
+
 def assign_document_augmentations(
     rows: list[dict[str, object]],
     *,
@@ -160,6 +226,7 @@ def assign_document_augmentations(
     rotation_high_rate: float = 0.10,
     tps_rate: float = 0.30,
     tps_high_rate: float = 0.10,
+    font_scale: float = 0.65,
     seed: int = 13,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     """Assign exact per-font counts and deterministic effect choices."""
@@ -266,14 +333,66 @@ def assign_document_augmentations(
 
             if index in background_indices:
                 assert paper_backgrounds is not None
-                background = paper_backgrounds[
-                    _stable_seed(font_seed, row["image_id"], "paper_background")
-                    % len(paper_backgrounds)
+                allowed_tiers, effective_text_scale = _allowed_background_tiers(
+                    item,
+                    font_scale=font_scale,
+                    local_effect=str(item["document_augmentation_local"]),
+                )
+                compatible = [
+                    background
+                    for background in paper_backgrounds
+                    if background.luminance_tier in allowed_tiers
                 ]
+                background_seed = _stable_seed(
+                    font_seed, row["image_id"], "paper_background"
+                )
+                background = _select_background(compatible, seed=background_seed)
+                same_mode = [
+                    candidate
+                    for candidate in paper_backgrounds
+                    if candidate.pil_mode == background.pil_mode
+                ]
+                light_same_mode = [
+                    candidate
+                    for candidate in same_mode
+                    if candidate.luminance_tier == "light"
+                ]
+                fallback_pool = light_same_mode or sorted(
+                    same_mode,
+                    key=lambda candidate: candidate.mean_luminance,
+                    reverse=True,
+                )
+                fallback = _select_background(
+                    fallback_pool,
+                    seed=_stable_seed(font_seed, row["image_id"], "paper_fallback"),
+                )
                 item["document_augmentation_paper_source"] = "real"
                 item["document_augmentation_background_id"] = background.background_id
                 item["document_augmentation_background_uri"] = background.source_s3_uri
                 item["document_augmentation_background_mode"] = background.pil_mode
+                item["document_augmentation_background_luminance_tier"] = (
+                    background.luminance_tier
+                )
+                item["document_augmentation_background_mean_luminance"] = round(
+                    background.mean_luminance, 4
+                )
+                item["document_augmentation_effective_text_scale"] = round(
+                    effective_text_scale, 4
+                )
+                item["document_augmentation_background_readability_fallback"] = 0
+                item["_document_augmentation_fallback_background_id"] = (
+                    fallback.background_id
+                )
+                item["_document_augmentation_fallback_background_uri"] = (
+                    fallback.source_s3_uri
+                )
+                item["_document_augmentation_fallback_background_mode"] = fallback.pil_mode
+                item["_document_augmentation_fallback_background_luminance_tier"] = (
+                    fallback.luminance_tier
+                )
+                item["_document_augmentation_fallback_background_mean_luminance"] = round(
+                    fallback.mean_luminance, 4
+                )
                 item["document_augmentation_paper_effect"] = ""
                 item["document_augmentation_paper_strength"] = ""
                 item["document_augmentation_output_mode"] = background.pil_mode
@@ -295,6 +414,10 @@ def assign_document_augmentations(
                 item["document_augmentation_background_id"] = ""
                 item["document_augmentation_background_uri"] = ""
                 item["document_augmentation_background_mode"] = ""
+                item["document_augmentation_background_luminance_tier"] = ""
+                item["document_augmentation_background_mean_luminance"] = ""
+                item["document_augmentation_effective_text_scale"] = ""
+                item["document_augmentation_background_readability_fallback"] = 0
                 item["document_augmentation_paper_effect"] = paper_effect
                 item["document_augmentation_paper_strength"] = paper_strength
                 item["document_augmentation_output_mode"] = output_mode
@@ -305,6 +428,10 @@ def assign_document_augmentations(
                 item["document_augmentation_background_id"] = ""
                 item["document_augmentation_background_uri"] = ""
                 item["document_augmentation_background_mode"] = ""
+                item["document_augmentation_background_luminance_tier"] = ""
+                item["document_augmentation_background_mean_luminance"] = ""
+                item["document_augmentation_effective_text_scale"] = ""
+                item["document_augmentation_background_readability_fallback"] = 0
                 item["document_augmentation_paper_effect"] = ""
                 item["document_augmentation_paper_strength"] = ""
                 item["document_augmentation_output_mode"] = "L"
@@ -414,8 +541,21 @@ def assign_document_augmentations(
             "real_background_modes": dict(
                 Counter(background.pil_mode for background in (paper_backgrounds or []))
             ),
+            "real_background_luminance_tiers": dict(
+                Counter(
+                    background.luminance_tier
+                    for background in (paper_backgrounds or [])
+                )
+            ),
             "exclusive_sources": ["real", "synthetic", "clean"],
             "bilevel_encoding": "TIFF Group 4",
+            "readability_policy": {
+                "light_only_below_effective_text_scale": 36_000,
+                "no_dark_below_effective_text_scale": 50_000,
+                "light_only_effects": ["letterpress", "hollow_rare"],
+                "dark_background_max_lines": 6,
+                "medium_background_max_lines": 7,
+            },
         },
         "geometric_policy": {
             "rate_interpretation": "high rates are shares of all images, not of augmented images",

@@ -12,13 +12,13 @@ This post adds manually reviewed paper backgrounds, makes paper selection an exp
 
 We began with 2,000 pages that the `script_classification_v2` pipeline had classified as blank. Candidates were restricted to pecha-like aspect ratios and downloaded at their original resolution for visual review.
 
-Automatic blank-page classification is useful but not sufficient. Pages can still contain intrusive borders, catalog marks, severe damage, partial text, or other features that make them poor generic backgrounds. After manual removal of unsuitable candidates, **1,102 backgrounds** remain:
+Automatic blank-page classification is useful but not sufficient. Pages can still contain intrusive borders, catalog marks, severe damage, partial text, or other features that make them poor generic backgrounds. After two rounds of manual removal of unsuitable candidates, **1,087 backgrounds** remain:
 
-- **854 RGB** pages;
-- **112 grayscale** pages;
+- **840 RGB** pages;
+- **111 grayscale** pages;
 - **136 bilevel** (`1`) pages.
 
-The retained list is committed as [`paper_backgrounds.csv`](../synthetic_benchmark/data/paper_backgrounds.csv). It records a stable background id, source S3 URI, dimensions, orientation, image mode, and source identifiers. The images themselves remain in their original archive location; the renderer uses reviewed local copies when available and otherwise caches only the assigned sources from S3.
+The retained list is committed as [`paper_backgrounds.csv`](../synthetic_benchmark/data/paper_backgrounds.csv). It records a stable background id, source S3 URI, dimensions, orientation, image mode, luminance statistics, and source identifiers. The images themselves remain in their original archive location; the renderer uses reviewed local copies when available and otherwise caches only the assigned sources from S3.
 
 ---
 
@@ -33,6 +33,15 @@ Paper appearance is now an exclusive deterministic choice, balanced independentl
 “Clean” describes the paper state, not the entire page. Ink effects, rotation, TPS, folding, and blur are assigned separately, so a clean-white page can still have imperfect ink or measured geometric distortion.
 
 Separating paper from ink fixes an ambiguity in the earlier policy. SubtleNoise, NoiseTexturize, and ColorPaper are no longer mixed into the same weighted pool as ink bleed and letterpress. Real-background pages never receive synthetic paper color or page noise. Ink effects can still be applied before any of the three paper states.
+
+Brightness is not assigned blindly. The retained backgrounds now include mean,
+percentile, contrast, and dark-pixel measurements and are divided into light,
+medium, and dark tiers. Small text at low output resolution—and text receiving
+lightening effects such as letterpress—is restricted to light paper. Once
+LuaLaTeX reveals the actual line count, unexpectedly dense pages on dark or
+medium paper switch deterministically to a light background of the same image
+mode. This keeps the challenging dark scans for pages whose text remains large
+enough to read.
 
 ---
 
@@ -109,32 +118,15 @@ An example from the quality-65 subset:
 
 The assigned width and JPEG quality are stored in every catalog and alignment row. A run-level `image_output_manifest.json` records the configured range, rates, seed, and per-font counts.
 
----
-
-## Fifty pages through the production policy
-
-For review, we rendered 50 pages drawn from five source font files/faces, with ten pages per face. This preserves exact small-sample paper counts:
-
-- **30 real backgrounds, 15 synthetic-paper pages, and 5 clean-paper pages**;
-- **25 RGB, 21 grayscale, and 4 bilevel outputs**;
-- **46 JPEGs and 4 Group 4 TIFFs**;
-- **41 JPEGs at quality 85 and 5 at quality 65**;
-- widths from **1,802 to 3,455 pixels**, with 49 distinct widths among 50 pages;
-- no missing image/alignment pairs.
-
-The first 25 pages:
-
-![First contact sheet of full-policy Tibetan benchmark pages](assets/07-paper-backgrounds/contact_sheet_01.jpg)
-
-The next 25:
-
-![Second contact sheet of full-policy Tibetan benchmark pages](assets/07-paper-backgrounds/contact_sheet_02.jpg)
-
-These contact sheets convert every page to RGB JPEG only for browser display. The review render keeps the actual mixed formats under `synthetic_benchmark/out/pipeline_review_50/`, alongside 50 convenient previews and a review manifest under its `review/` directory.
+Ordinary line spacing varies independently from 1.18 to 1.32 times the font
+size, centered on the previous 1.25 default. Pages containing five-, six-, or
+seven-plus-codepoint Tibetan stacks receive progressively larger leading, while
+LuaTeX supplies a final glyph-offset-aware safety check. Ordinary prose keeps
+its normal density; only pages that need room for tall stacks become looser.
 
 ---
 
-## Reproducing the review
+## Running the policy
 
 The normal production command enables the complete document policy:
 
@@ -148,6 +140,6 @@ python synthetic_benchmark/render_batches.py \
 
 The defaults are 60% real paper, 30% synthetic paper, 10% clean paper, widths from 1,800 to 3,500 pixels, JPEG quality 85, and a 10% quality-65 subset. Fixed-width experiments remain available through `--image-width-px`.
 
-Implementation: [`paper_backgrounds.py`](../synthetic_benchmark/paper_backgrounds.py), [`document_augmentation.py`](../synthetic_benchmark/document_augmentation.py), [`image_output_policy.py`](../synthetic_benchmark/image_output_policy.py), and [`render_batches.py`](../synthetic_benchmark/render_batches.py). Review previews and contact sheets are reproducible with [`create_pipeline_review_assets.py`](../synthetic_benchmark/create_pipeline_review_assets.py).
+Implementation: [`paper_backgrounds.py`](../synthetic_benchmark/paper_backgrounds.py), [`update_paper_background_manifest.py`](../synthetic_benchmark/update_paper_background_manifest.py), [`document_augmentation.py`](../synthetic_benchmark/document_augmentation.py), [`image_output_policy.py`](../synthetic_benchmark/image_output_policy.py), [`page_layout_policy.py`](../synthetic_benchmark/page_layout_policy.py), and [`render_batches.py`](../synthetic_benchmark/render_batches.py).
 
 *Series: [1 · Font coverage](01-font-coverage-before-synthetic-ocr.md) · [2 · LuaLaTeX pecha pages](02-rendering-pecha-pages-with-lualatex.md) · [3 · Shorthands](03-shorthand-augmentations.md) · [4 · Font-space augmentation](04-font-space-augmentation.md) · [5 · Image augmentation](05-image-augmentation.md) · [6 · Measured geometry](06-measured-geometric-augmentation.md) · 7 · Real paper and encoding*

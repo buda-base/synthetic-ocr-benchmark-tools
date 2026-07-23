@@ -15,6 +15,7 @@ from document_augmentation import (
     _apply_vertical_tps,
     apply_document_augmentations,
     assign_document_augmentations,
+    enforce_background_readability_for_line_count,
 )
 from paper_backgrounds import PaperBackground
 
@@ -191,6 +192,52 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
                     self.assertFalse(row["document_augmentation_background_id"])
                     self.assertFalse(row["document_augmentation_paper_effect"])
         self.assertEqual(manifest["requested_rates"]["clean_paper"], 0.10)
+
+    def test_fragile_text_only_uses_light_backgrounds(self) -> None:
+        backgrounds = [
+            PaperBackground(
+                **{
+                    **background.__dict__,
+                    "background_id": f"{background.background_id}-{tier}",
+                    "luminance_tier": tier,
+                    "mean_luminance": 230.0 if tier == "light" else 110.0,
+                }
+            )
+            for background in sample_backgrounds()
+            for tier in ("light", "dark")
+        ]
+        rows = sample_rows(fonts=1, images_per_font=20)
+        for row in rows:
+            row["font_size_pt"] = 24
+            row["output_width_px"] = 1800
+        prepared, _manifest = assign_document_augmentations(
+            rows,
+            paper_backgrounds=backgrounds,
+            background_rate=1.0,
+            synthetic_paper_rate=0.0,
+            local_rate=0.0,
+        )
+        self.assertEqual(
+            {row["document_augmentation_background_luminance_tier"] for row in prepared},
+            {"light"},
+        )
+
+    def test_dense_page_replaces_dark_background_with_light_fallback(self) -> None:
+        row = {
+            "document_augmentation_paper_source": "real",
+            "document_augmentation_background_luminance_tier": "dark",
+            "document_augmentation_background_readability_fallback": 0,
+            "_document_augmentation_fallback_background_id": "light-id",
+            "_document_augmentation_fallback_background_uri": "s3://example/light.jpg",
+            "_document_augmentation_fallback_background_mode": "RGB",
+            "_document_augmentation_fallback_background_luminance_tier": "light",
+            "_document_augmentation_fallback_background_mean_luminance": 230.0,
+            "_document_augmentation_fallback_background_path": "/tmp/light.jpg",
+        }
+        self.assertTrue(enforce_background_readability_for_line_count(row, 8))
+        self.assertEqual(row["document_augmentation_background_id"], "light-id")
+        self.assertEqual(row["document_augmentation_background_luminance_tier"], "light")
+        self.assertEqual(row["document_augmentation_background_readability_fallback"], 1)
 
     def test_vertical_tps_preserves_dimensions_and_changes_pixels(self) -> None:
         image = np.full((120, 300, 3), 255, dtype=np.uint8)

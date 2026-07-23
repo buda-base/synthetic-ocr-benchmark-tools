@@ -61,10 +61,12 @@ def rgb_preview(path: Path) -> Image.Image:
 def row_label(index: int, row: dict[str, str]) -> tuple[str, str]:
     paper = row["document_augmentation_paper_source"]
     mode = row["document_augmentation_output_mode"]
+    tier = row.get("document_augmentation_background_luminance_tier") or ""
+    paper_label = f"{paper}/{tier}/{mode}" if tier else f"{paper}/{mode}"
     width = row["output_width_px"]
     quality = row["output_jpeg_quality"] if row["image_file_name"].endswith(".jpg") else "G4"
     line_one = (
-        f"{index:02d}  {font_label(row)}  |  {paper}/{mode}  |  "
+        f"{index:02d}  {font_label(row)}  |  {paper_label}  |  "
         f"{width}px  |  Q{quality}"
     )
     effects = [
@@ -166,9 +168,20 @@ def write_review_manifest(
         "font_name",
         "document_augmentation_paper_source",
         "document_augmentation_background_id",
+        "document_augmentation_background_luminance_tier",
+        "document_augmentation_background_mean_luminance",
+        "document_augmentation_background_readability_fallback",
         "document_augmentation_output_mode",
         "output_width_px",
         "output_jpeg_quality",
+        "layout_line_spacing_factor",
+        "layout_max_stack_codepoints",
+        "layout_stack_spacing_extra",
+        "layout_font_scale_multiplier",
+        "layout_density_tier",
+        "source_text_difficulty_tier",
+        "source_text_rarity_tier",
+        "source_text_difficulty_basis",
         "document_augmentation_local",
         "document_augmentation_spatial",
         "document_augmentation_tps_strength",

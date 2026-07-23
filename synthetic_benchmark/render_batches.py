@@ -69,7 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--page-ratio", type=float, default=4.0, help="page width / height")
     parser.add_argument("--margin-x-mm", type=float, default=20.0)
     parser.add_argument("--margin-y-mm", type=float, default=16.0)
-    parser.add_argument("--font-scale", type=float, default=1.5)
+    parser.add_argument("--font-scale", type=float, default=0.65)
+    parser.add_argument("--min-line-spacing-factor", type=float, default=1.18)
+    parser.add_argument("--max-line-spacing-factor", type=float, default=1.32)
+    parser.add_argument("--line-spacing-seed", type=int, default=13)
+    parser.add_argument("--line-collision-clearance-pt", type=float, default=1.5)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--low-jpeg-quality", type=int, default=65)
     parser.add_argument("--low-jpeg-quality-rate", type=float, default=0.10)
@@ -355,6 +359,40 @@ local function collect_line_markers(head, lines)
   end
 end
 
+local function expand_line_ink_extents(head)
+  if not head or type(head) == "number" then
+    return head
+  end
+  for line in node.traverse(head) do
+    if line.id == hlist_id and is_text_hlist(line) then
+      local maximum_upward_offset = 0
+      local maximum_downward_offset = 0
+      local child = child_list(line)
+      if child then
+        for glyph in node.traverse_id(glyph_id, child) do
+          local yoffset = glyph.yoffset or 0
+          maximum_upward_offset = math.max(maximum_upward_offset, yoffset)
+          maximum_downward_offset = math.max(maximum_downward_offset, -yoffset)
+        end
+      end
+      local baseline = tex.baselineskip and tex.baselineskip.width or 0
+      local ordinary_offset = baseline
+      local maximum_extra = baseline * 0.75
+      local extra_height = math.min(
+        maximum_extra,
+        math.max(0, maximum_upward_offset - ordinary_offset)
+      )
+      local extra_depth = math.min(
+        maximum_extra,
+        math.max(0, maximum_downward_offset - ordinary_offset)
+      )
+      line.height = (line.height or 0) + extra_height
+      line.depth = (line.depth or 0) + extra_depth
+    end
+  end
+  return head
+end
+
 function synthetic_set_chunk(id)
   synthetic_current_chunk = id
   tex.count.syllid = 0
@@ -393,8 +431,10 @@ local function synthetic_pre_shipout_filter(head)
 end
 
 if luatexbase and luatexbase.add_to_callback then
+  luatexbase.add_to_callback("post_linebreak_filter", expand_line_ink_extents, "synthetic_line_extents")
   luatexbase.add_to_callback("pre_shipout_filter", synthetic_pre_shipout_filter, "synthetic_page_map")
 else
+  callback.register("post_linebreak_filter", expand_line_ink_extents)
   callback.register("pre_shipout_filter", synthetic_pre_shipout_filter)
 end
 }}"""
@@ -404,14 +444,20 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
     first = rows[0]
     height = args.page_height_mm
     width = height * args.page_ratio
-    font_size = float(first["font_size_pt"]) * args.font_scale
-    baseline = font_size * 1.25
     pages = []
     for row in rows:
         body = add_marked_breakpoints(tex_escape(str(row["text"])))
+        font_size = (
+            float(row["font_size_pt"])
+            * args.font_scale
+            * float(row.get("layout_font_scale_multiplier") or 1.0)
+        )
+        line_spacing_factor = float(row.get("layout_line_spacing_factor") or 1.25)
+        baseline = font_size * line_spacing_factor
         pages.append(
             "\\noindent\n"
             f"\\directlua{{synthetic_set_chunk(\"{row['render_id']}\")}}\n"
+            f"\\fontsize{{{fmt_dim(font_size)}pt}}{{{fmt_dim(baseline)}pt}}\\selectfont\n"
             f"{body}\n"
             "\\clearpage\n"
         )
@@ -429,6 +475,8 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
 \usepackage{{hyperref}}
 \setlength{{\parindent}}{{0pt}}
 \setlength{{\parskip}}{{0pt}}
+\lineskiplimit=0.5pt
+\lineskip={fmt_dim(args.line_collision_clearance_pt)}pt
 \emergencystretch=1em
 \tolerance=9999
 \pretolerance=9999
@@ -454,7 +502,6 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
 \setmainfont{{DUMMY}}[
   {fontspec_options(first)}
 ]
-\fontsize{{{fmt_dim(font_size)}pt}}{{{fmt_dim(baseline)}pt}}\selectfont
 \begin{{document}}
 {''.join(pages)}
 \end{{document}}
@@ -566,6 +613,22 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
         float(first.get("stack_difficulty_score") or 0.0),
         float(second.get("stack_difficulty_score") or 0.0),
     )
+    source_tiers = {
+        str(first.get("source_text_difficulty_tier") or ""),
+        str(second.get("source_text_difficulty_tier") or ""),
+    } - {""}
+    if source_tiers:
+        first["source_text_difficulty_tier"] = (
+            next(iter(source_tiers)) if len(source_tiers) == 1 else "mixed"
+        )
+    rarity_tiers = {
+        str(first.get("source_text_rarity_tier") or ""),
+        str(second.get("source_text_rarity_tier") or ""),
+    } - {""}
+    if rarity_tiers:
+        first["source_text_rarity_tier"] = (
+            next(iter(rarity_tiers)) if len(rarity_tiers) == 1 else "mixed"
+        )
     return first
 
 
@@ -612,8 +675,11 @@ def assign_render_ids(rows: list[dict[str, object]]) -> None:
 
 def set_render_size_fields(rows: list[dict[str, object]], font_scale: float) -> None:
     for row in rows:
-        row["font_scale"] = font_scale
-        row["rendered_font_size_pt"] = float(row["font_size_pt"]) * font_scale
+        multiplier = float(row.get("layout_font_scale_multiplier") or 1.0)
+        effective_scale = font_scale * multiplier
+        row["base_font_scale"] = font_scale
+        row["font_scale"] = effective_scale
+        row["rendered_font_size_pt"] = float(row["font_size_pt"]) * effective_scale
 
 
 def add_prefix_to_alternating_pages(
@@ -760,6 +826,22 @@ def write_text_and_catalog(
                 "image_file_name": image_relpath.as_posix(),
                 "output_width_px": row.get("output_width_px") or "",
                 "output_jpeg_quality": row.get("output_jpeg_quality") or "",
+                "layout_line_spacing_factor": (
+                    row.get("layout_line_spacing_factor") or ""
+                ),
+                "layout_base_line_spacing_factor": (
+                    row.get("layout_base_line_spacing_factor") or ""
+                ),
+                "layout_max_stack_codepoints": (
+                    row.get("layout_max_stack_codepoints") or 0
+                ),
+                "layout_stack_spacing_extra": (
+                    row.get("layout_stack_spacing_extra") or 0
+                ),
+                "layout_font_scale_multiplier": (
+                    row.get("layout_font_scale_multiplier") or 1.0
+                ),
+                "layout_density_tier": row.get("layout_density_tier") or "",
                 "transcription": text,
                 "source_plan_image_ids": "|".join(row["_source_plan_image_ids"]),
                 "page_prefix_added": row.get("page_prefix_added", 0),
@@ -769,6 +851,7 @@ def write_text_and_catalog(
                 "ps_name": row["ps_name"],
                 "ttc_face_index": row.get("ttc_face_index") or "",
                 "font_size_pt": row["font_size_pt"],
+                "base_font_scale": row.get("base_font_scale") or "",
                 "font_scale": row.get("font_scale") or "",
                 "rendered_font_size_pt": row.get("rendered_font_size_pt") or "",
                 "script_id": row["script_id"],
@@ -778,6 +861,21 @@ def write_text_and_catalog(
                 "script": row.get("script") or normalized_script(str(row.get("script_type") or "")),
                 "etext_source": "|".join(row.get("_source_etext_sources") or [str(row.get("etext_source") or "")]),
                 "stack_difficulty_score": row.get("stack_difficulty_score"),
+                "source_text_difficulty_tier": (
+                    row.get("source_text_difficulty_tier") or ""
+                ),
+                "source_text_rarity_tier": (
+                    row.get("source_text_rarity_tier") or ""
+                ),
+                "source_text_difficulty_basis": (
+                    row.get("source_text_difficulty_basis") or ""
+                ),
+                "source_text_selection_pool": (
+                    row.get("source_text_selection_pool") or ""
+                ),
+                "requested_text_difficulty_tier": (
+                    row.get("requested_text_difficulty_tier") or ""
+                ),
                 "suggested_split": row.get("suggested_split") or "",
                 "bocorpus_row": "|".join(row["_source_bocorpus_rows"]),
                 "char_start": row["char_start"],
@@ -810,6 +908,18 @@ def write_text_and_catalog(
                 ),
                 "document_augmentation_background_mode": (
                     row.get("document_augmentation_background_mode") or ""
+                ),
+                "document_augmentation_background_luminance_tier": (
+                    row.get("document_augmentation_background_luminance_tier") or ""
+                ),
+                "document_augmentation_background_mean_luminance": (
+                    row.get("document_augmentation_background_mean_luminance") or ""
+                ),
+                "document_augmentation_effective_text_scale": (
+                    row.get("document_augmentation_effective_text_scale") or ""
+                ),
+                "document_augmentation_background_readability_fallback": (
+                    row.get("document_augmentation_background_readability_fallback") or 0
                 ),
                 "document_augmentation_paper_effect": (
                     row.get("document_augmentation_paper_effect") or ""
@@ -1043,8 +1153,17 @@ def render_batch(
             str(row.get("document_augmentation_output_extension") or ".jpg"),
         )
         if getattr(args, "document_augmentation", False):
-            from document_augmentation import apply_document_augmentations
+            from document_augmentation import (
+                apply_document_augmentations,
+                enforce_background_readability_for_line_count,
+            )
 
+            pages = content_pages(pages_by_chunk[str(row["render_id"])])
+            first_page = (pages or pages_by_chunk[str(row["render_id"])])[0]
+            enforce_background_readability_for_line_count(
+                row,
+                int(first_page["line_count"]),
+            )
             apply_document_augmentations(
                 src,
                 dest,
@@ -1321,6 +1440,22 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "pagination": int(row["page_in_volume"]),
                 "output_width_px": int(row["output_width_px"]),
                 "output_jpeg_quality": int(row["output_jpeg_quality"]),
+                "layout_line_spacing_factor": float(
+                    row["layout_line_spacing_factor"]
+                ),
+                "layout_base_line_spacing_factor": float(
+                    row["layout_base_line_spacing_factor"]
+                ),
+                "layout_max_stack_codepoints": int(
+                    row.get("layout_max_stack_codepoints") or 0
+                ),
+                "layout_stack_spacing_extra": float(
+                    row.get("layout_stack_spacing_extra") or 0
+                ),
+                "layout_font_scale_multiplier": float(
+                    row.get("layout_font_scale_multiplier") or 1.0
+                ),
+                "layout_density_tier": row.get("layout_density_tier") or "",
                 "font_name": row.get("font_name") or "",
                 "script_8": row.get("script_8") or "",
                 "etext_source": row.get("etext_source") or "",
@@ -1328,6 +1463,21 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     float(row["stack_difficulty_score"])
                     if row.get("stack_difficulty_score") not in (None, "")
                     else None
+                ),
+                "source_text_difficulty_tier": (
+                    row.get("source_text_difficulty_tier") or ""
+                ),
+                "source_text_rarity_tier": (
+                    row.get("source_text_rarity_tier") or ""
+                ),
+                "source_text_difficulty_basis": (
+                    row.get("source_text_difficulty_basis") or ""
+                ),
+                "source_text_selection_pool": (
+                    row.get("source_text_selection_pool") or ""
+                ),
+                "requested_text_difficulty_tier": (
+                    row.get("requested_text_difficulty_tier") or ""
                 ),
                 "suggested_split": row.get("suggested_split") or "",
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
@@ -1343,6 +1493,24 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 ),
                 "document_augmentation_background_mode": (
                     row.get("document_augmentation_background_mode") or ""
+                ),
+                "document_augmentation_background_luminance_tier": (
+                    row.get("document_augmentation_background_luminance_tier") or ""
+                ),
+                "document_augmentation_background_mean_luminance": (
+                    float(row["document_augmentation_background_mean_luminance"])
+                    if row.get("document_augmentation_background_mean_luminance")
+                    not in (None, "")
+                    else None
+                ),
+                "document_augmentation_effective_text_scale": (
+                    float(row["document_augmentation_effective_text_scale"])
+                    if row.get("document_augmentation_effective_text_scale")
+                    not in (None, "")
+                    else None
+                ),
+                "document_augmentation_background_readability_fallback": int(
+                    row.get("document_augmentation_background_readability_fallback") or 0
                 ),
                 "document_augmentation_paper_effect": (
                     row.get("document_augmentation_paper_effect") or ""
@@ -1412,7 +1580,9 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "except for a deterministic 10% subset at quality 65. Runs without document "
         "augmentation use grayscale JPEG. Augmented pages "
         "preserve their paper source: grayscale and RGB paper use matching JPEG modes, "
-        "while bilevel paper uses Group 4 TIFF. The rendered transcription preserves line breaks recovered "
+        "while bilevel paper uses Group 4 TIFF. Background luminance is matched to text "
+        "size and rendered line density. Line spacing varies per page, with local "
+        "glyph-aware clearance for unusually tall stacks. The rendered transcription preserves line breaks recovered "
         "from LuaTeX line markers. The alignment parquet files contain page-to-text rows "
         "plus synthetic metadata: `font_name`, `script_8`, `etext_source`, "
         "`stack_difficulty_score`, `suggested_split`, and—when enabled—deterministic "
@@ -1421,9 +1591,11 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "The render plan aims for a balanced distribution across the 8-way Tibetan script "
         "classification (`script_8`) while keeping image volumes pure with respect to "
         "`uchen` versus `ume`. Split assignment is by font name: a font appears in only "
-        "one of `train`, `val`, or `test`. Chunks are considered from highest to lowest "
-        "stack difficulty, so rare or difficult stack patterns are preferentially included "
-        "when compatible fonts can render them. Chunk reuse is allowed only within a single "
+        "one of `train`, `val`, or `test`. Each font face receives an equal mix of normal "
+        "source text without rare stacks and difficult text prioritizing rare stacks, before "
+        "text augmentation. Fonts without enough compatible rare text use their most "
+        "structurally complex compatible common chunks for the difficult half. "
+        "Chunk reuse is allowed only within a single "
         "split and is capped at 10%.\n\n"
         "## Rights\n\n"
         "The source texts are considered public domain, and the synthetic rendered images "
@@ -1687,57 +1859,15 @@ def main() -> None:
     if args.limit is not None:
         rows = rows[: args.limit]
     if existing_catalog_rows and any(
-        "output_width_px" not in row or "output_jpeg_quality" not in row
+        "output_width_px" not in row
+        or "output_jpeg_quality" not in row
+        or "layout_line_spacing_factor" not in row
         for row in existing_catalog_rows
     ):
         raise SystemExit(
-            "Cannot resume checkpoints created without randomized output-size/quality "
+            "Cannot resume checkpoints created without randomized output/layout "
             "metadata; use a new --out-dir or --force."
         )
-    if args.document_augmentation:
-        from document_augmentation import (
-            assign_document_augmentations,
-            write_document_augmentation_manifest,
-        )
-        from paper_backgrounds import load_paper_backgrounds
-
-        if existing_catalog_rows and any(
-            "document_augmentation_paper_source" not in row for row in existing_catalog_rows
-        ):
-            raise SystemExit(
-                "Cannot enable document augmentation while resuming checkpoints created "
-                "without paper-background metadata; use a new --out-dir or --force."
-            )
-        paper_backgrounds = load_paper_backgrounds(args.paper_background_manifest)
-        rows, document_manifest = assign_document_augmentations(
-            rows,
-            paper_backgrounds=paper_backgrounds,
-            local_rate=args.document_augmentation_rate,
-            background_rate=args.paper_background_rate,
-            synthetic_paper_rate=args.synthetic_paper_rate,
-            inkshifter_rate=args.inkshifter_rate,
-            folding_rate=args.folding_rate,
-            blur_rate=args.blur_rate,
-            rotation_rate=args.rotation_rate,
-            rotation_high_rate=args.rotation_high_rate,
-            tps_rate=args.tps_rate,
-            tps_high_rate=args.tps_high_rate,
-            seed=args.document_augmentation_seed,
-        )
-        document_manifest["paper_policy"]["manifest_path"] = str(
-            args.paper_background_manifest
-        )
-        document_manifest_path = args.out_dir / "document_augmentation_manifest.json"
-        write_document_augmentation_manifest(document_manifest_path, document_manifest)
-        print(
-            f"Document augmentation enabled: real paper on "
-            f"{args.paper_background_rate:.1%}, synthetic paper on "
-            f"{args.synthetic_paper_rate:.1%}, local ink effects on "
-            f"{args.document_augmentation_rate:.1%}, rotation on "
-            f"{args.rotation_rate:.1%}, and TPS on {args.tps_rate:.1%} "
-            f"of planned images per source font"
-        )
-        print(f"Wrote {document_manifest_path}")
     from image_output_policy import assign_image_output_parameters
 
     rows, image_output_manifest = assign_image_output_parameters(
@@ -1760,6 +1890,75 @@ def main() -> None:
         f"{args.low_jpeg_quality_rate:.1%} at quality {args.low_jpeg_quality}"
     )
     print(f"Wrote {image_output_manifest_path}")
+    from page_layout_policy import assign_page_layout_parameters
+
+    rows, page_layout_manifest = assign_page_layout_parameters(
+        rows,
+        min_line_spacing_factor=args.min_line_spacing_factor,
+        max_line_spacing_factor=args.max_line_spacing_factor,
+        seed=args.line_spacing_seed,
+    )
+    page_layout_manifest["collision_policy"]["clearance_pt"] = (
+        args.line_collision_clearance_pt
+    )
+    page_layout_manifest_path = args.out_dir / "page_layout_manifest.json"
+    page_layout_manifest_path.write_text(
+        json.dumps(page_layout_manifest, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"Base line spacing assigned from {args.min_line_spacing_factor:.2f} to "
+        f"{args.max_line_spacing_factor:.2f} times font size with tall-stack clearance; "
+        "10% of pages use a sparse font-size multiplier"
+    )
+    print(f"Wrote {page_layout_manifest_path}")
+    if args.document_augmentation:
+        from document_augmentation import (
+            assign_document_augmentations,
+            write_document_augmentation_manifest,
+        )
+        from paper_backgrounds import load_paper_backgrounds
+
+        if existing_catalog_rows and any(
+            "document_augmentation_background_luminance_tier" not in row
+            for row in existing_catalog_rows
+        ):
+            raise SystemExit(
+                "Cannot enable document augmentation while resuming checkpoints created "
+                "without paper-background metadata; use a new --out-dir or --force."
+            )
+        paper_backgrounds = load_paper_backgrounds(args.paper_background_manifest)
+        rows, document_manifest = assign_document_augmentations(
+            rows,
+            paper_backgrounds=paper_backgrounds,
+            local_rate=args.document_augmentation_rate,
+            background_rate=args.paper_background_rate,
+            synthetic_paper_rate=args.synthetic_paper_rate,
+            inkshifter_rate=args.inkshifter_rate,
+            folding_rate=args.folding_rate,
+            blur_rate=args.blur_rate,
+            rotation_rate=args.rotation_rate,
+            rotation_high_rate=args.rotation_high_rate,
+            tps_rate=args.tps_rate,
+            tps_high_rate=args.tps_high_rate,
+            font_scale=args.font_scale,
+            seed=args.document_augmentation_seed,
+        )
+        document_manifest["paper_policy"]["manifest_path"] = str(
+            args.paper_background_manifest
+        )
+        document_manifest_path = args.out_dir / "document_augmentation_manifest.json"
+        write_document_augmentation_manifest(document_manifest_path, document_manifest)
+        print(
+            f"Document augmentation enabled: real paper on "
+            f"{args.paper_background_rate:.1%}, synthetic paper on "
+            f"{args.synthetic_paper_rate:.1%}, local ink effects on "
+            f"{args.document_augmentation_rate:.1%}, rotation on "
+            f"{args.rotation_rate:.1%}, and TPS on {args.tps_rate:.1%} "
+            f"of planned images per source font"
+        )
+        print(f"Wrote {document_manifest_path}")
     if existing_catalog_rows:
         before = len(rows)
         rows = filter_completed_plan_rows(rows, existing_catalog_rows, args.out_dir)

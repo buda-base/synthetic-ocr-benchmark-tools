@@ -20,6 +20,14 @@ DEFAULT_BACKGROUND_MANIFEST = (
 THREAD_LOCAL = threading.local()
 
 
+def classify_luminance(mean_luminance: float, p10_luminance: float) -> str:
+    if mean_luminance >= 200 and p10_luminance >= 160:
+        return "light"
+    if mean_luminance < 150 or p10_luminance < 40:
+        return "dark"
+    return "medium"
+
+
 @dataclass(frozen=True)
 class PaperBackground:
     background_id: str
@@ -36,6 +44,14 @@ class PaperBackground:
     exif_orientation: int | None
     pil_mode: str
     size_bytes: int
+    mean_luminance: float = 255.0
+    median_luminance: float = 255.0
+    p10_luminance: float = 255.0
+    p90_luminance: float = 255.0
+    luminance_std: float = 0.0
+    dark_pixel_fraction: float = 0.0
+    luminance_tier: str = "light"
+    luminance_stats_version: str = ""
 
 
 def load_paper_backgrounds(path: Path = DEFAULT_BACKGROUND_MANIFEST) -> list[PaperBackground]:
@@ -59,6 +75,14 @@ def load_paper_backgrounds(path: Path = DEFAULT_BACKGROUND_MANIFEST) -> list[Pap
             ),
             pil_mode=row["pil_mode"],
             size_bytes=int(row["size_bytes"]),
+            mean_luminance=float(row.get("mean_luminance") or 255),
+            median_luminance=float(row.get("median_luminance") or 255),
+            p10_luminance=float(row.get("p10_luminance") or 255),
+            p90_luminance=float(row.get("p90_luminance") or 255),
+            luminance_std=float(row.get("luminance_std") or 0),
+            dark_pixel_fraction=float(row.get("dark_pixel_fraction") or 0),
+            luminance_tier=str(row.get("luminance_tier") or "light"),
+            luminance_stats_version=str(row.get("luminance_stats_version") or ""),
         )
         for row in rows
     ]
@@ -107,9 +131,13 @@ def prepare_paper_background_cache(
     by_id = {background.background_id: background for background in backgrounds}
     requested_ids = sorted(
         {
-            str(row.get("document_augmentation_background_id") or "")
+            str(row.get(field) or "")
             for row in rows
-            if row.get("document_augmentation_background_id")
+            for field in (
+                "document_augmentation_background_id",
+                "_document_augmentation_fallback_background_id",
+            )
+            if row.get(field)
         }
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +178,11 @@ def prepare_paper_background_cache(
         background_id = str(row.get("document_augmentation_background_id") or "")
         if background_id:
             row["_document_augmentation_background_path"] = str(resolved[background_id])
+        fallback_id = str(row.get("_document_augmentation_fallback_background_id") or "")
+        if fallback_id:
+            row["_document_augmentation_fallback_background_path"] = str(
+                resolved[fallback_id]
+            )
     return resolved
 
 

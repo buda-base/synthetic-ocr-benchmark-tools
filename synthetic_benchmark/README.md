@@ -92,7 +92,16 @@ Small with/without smoke plan (~2 images per font; even=`with`, odd=`none`):
   --output synthetic_benchmark/out/render_plan_shorthand_smoke.parquet
 ```
 
-The planner rejects a `(font, chunk)` candidate if any Tibetan stack in the whole chunk is unsupported by that font. Unknown stacks are treated as unsupported. It uses `ok=True` and, when present, `placement_warning_count=0`.
+The planner rejects a `(font, chunk)` candidate if any Tibetan stack in the
+whole chunk is unsupported by that font. Unknown stacks are treated as
+unsupported. It uses `ok=True` and, when present,
+`placement_warning_count=0`. Within every font face, it alternates source-text
+tiers so that half of the selected chunks contain no rare stacks (`normal`) and
+half prioritize stacks above the corpus rarity threshold (`difficult`). If a
+font cannot render enough rare-stack chunks, the difficult half uses its most
+structurally complex coverage-compatible common chunks instead. The rarity tier
+and fallback basis are recorded separately, before shorthand or other text
+augmentation.
 
 ## 2b. Review font-level augmentation
 
@@ -247,6 +256,13 @@ are exclusive. The selected source list is committed in
 `data/paper_backgrounds.csv`; local files are used when available, otherwise
 assigned sources are cached from S3.
 
+The manifest also records luminance statistics and a light/medium/dark tier. Small
+or visually fragile text is assigned only compatible paper: low effective text
+resolution and lightening effects such as letterpress use light backgrounds,
+while dark backgrounds are reserved for larger text. After LuaLaTeX reveals the
+actual line count, dense pages are deterministically switched to a light
+same-mode fallback when necessary.
+
 Independently, the closest integer to 90% of each font's planned images receives
 exactly one ink appearance effect. The weighted pool includes ink bleed,
 letterpress, bleed-through, dirty drum, dithering, and rare weak Hollow.
@@ -322,6 +338,15 @@ onto the selected real, synthetic, or clean paper before TPS, rotation, and blur
 Real backgrounds are stretched to the exact output dimensions rather than
 cropped when their aspect ratio differs.
 
+Line spacing is also deterministic but nonuniform: ordinary pages use a
+triangular baseline factor from 1.18 to 1.32 times the rendered font size. Pages
+whose source text contains five-, six-, or seven-plus-codepoint stacks receive
+progressively larger leading; a LuaTeX glyph-offset check supplies an additional
+safety floor. The base font scale is 0.65 for a condensed majority, while a
+balanced 10% sparse subset receives a 1.20–1.35 multiplier. This prevents
+superscript/subscript collisions without increasing ordinary line gaps globally
+and retains controlled page-density variation.
+
 Pecha page defaults:
 
 ```text
@@ -329,7 +354,7 @@ page_height = 74 mm
 page_width = 4 * page_height = 296 mm
 left/right margins = 20 mm
 top/bottom margins = 16 mm
-font scale = 1.5 * font_size_pt
+font scale = 0.65 * font_size_pt
 page prefix = ༄༅། ། on every other exported page, starting with page 1
 ```
 

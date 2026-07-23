@@ -123,6 +123,44 @@ def font_supports_chunk(font: FontCatalogRow, chunk: dict[str, object], supporte
     return stacks.issubset(font_supported)
 
 
+def chunk_difficulty_tier(chunk: dict[str, object]) -> str:
+    return "difficult" if float(chunk["stack_difficulty_score"]) > 0 else "normal"
+
+
+def build_difficulty_pools(
+    chunks: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    normal_chunks = [
+        chunk for chunk in chunks if chunk_difficulty_tier(chunk) == "normal"
+    ]
+    return {
+        "normal": sorted(
+            normal_chunks,
+            key=lambda row: (
+                int(row.get("unique_stack_count") or 0),
+                int(row.get("stack_count") or 0),
+                str(row["chunk_id"]),
+            ),
+        ),
+        "relative_difficult": sorted(
+            normal_chunks,
+            key=lambda row: (
+                -max(
+                    (len(stack) for stack in str(row.get("stacks") or "").split()),
+                    default=0,
+                ),
+                -int(row.get("unique_stack_count") or 0),
+                -int(row.get("stack_count") or 0),
+                str(row["chunk_id"]),
+            ),
+        ),
+        "difficult": sorted(
+            (chunk for chunk in chunks if chunk_difficulty_tier(chunk) == "difficult"),
+            key=lambda row: (-float(row["stack_difficulty_score"]), str(row["chunk_id"])),
+        ),
+    }
+
+
 def split_target_counts(total: int) -> dict[str, int]:
     train = int(total * SPLIT_RATIOS["train"])
     val = int(total * SPLIT_RATIOS["val"])
@@ -201,12 +239,13 @@ def next_chunk_for_font(
     chunk_use_counts: Counter[str],
     reused_chunk_ids: set[str],
     max_reused_chunks: int,
-    cursors: dict[tuple[str, str, bool], int],
+    cursors: dict[tuple[str, str, str, bool], int],
     *,
+    tier: str,
     allow_reuse: bool,
 ) -> dict[str, object] | None:
     font = font_info.font
-    cursor_key = (font.basename, font_info.split, allow_reuse)
+    cursor_key = (font.basename, font_info.split, tier, allow_reuse)
     idx = cursors.get(cursor_key, 0)
     while idx < len(chunks):
         chunk = chunks[idx]
@@ -242,7 +281,22 @@ def _plan_row_dict(
     font: FontCatalogRow,
     script: str,
     split: str,
+    requested_text_difficulty_tier: str,
+    selected_pool: str,
 ) -> dict[str, object]:
+    rarity_tier = chunk_difficulty_tier(chunk)
+    if requested_text_difficulty_tier == "difficult":
+        difficulty_basis = (
+            "rare_stacks"
+            if rarity_tier == "difficult"
+            else "relative_compatible_complexity"
+        )
+    else:
+        difficulty_basis = (
+            "no_rare_stacks"
+            if rarity_tier == "normal"
+            else "rare_stack_fallback"
+        )
     return {
         "image_id": image_id,
         "chunk_id": chunk["chunk_id"],
@@ -255,6 +309,11 @@ def _plan_row_dict(
         "unique_stack_count": chunk["unique_stack_count"],
         "stacks": chunk.get("stacks", ""),
         "stack_difficulty_score": float(chunk["stack_difficulty_score"]),
+        "source_text_difficulty_tier": requested_text_difficulty_tier,
+        "source_text_rarity_tier": rarity_tier,
+        "source_text_difficulty_basis": difficulty_basis,
+        "source_text_selection_pool": selected_pool,
+        "requested_text_difficulty_tier": requested_text_difficulty_tier,
         "basename": font.basename,
         "font_name": font_name(font),
         "font_file": font.font_file,
@@ -325,14 +384,14 @@ def make_per_font_plan_rows(
         if font.basename in supported and font.script_category and normalized_script(font.script_type)
     ]
     split_by_font_name = assign_font_splits(eligible_fonts, supported, rng)
-    chunks = sorted(chunks, key=lambda row: float(row["stack_difficulty_score"]), reverse=True)
+    difficulty_pools = build_difficulty_pools(chunks)
 
     rows: list[dict[str, object]] = []
     used_font_chunks: set[tuple[str, str]] = set()
     chunk_split: dict[str, str] = {}
     chunk_use_counts: Counter[str] = Counter()
     reused_chunk_ids: set[str] = set()
-    cursors: dict[tuple[str, str, bool], int] = {}
+    cursors: dict[tuple[str, str, str, bool], int] = {}
     target_images = len(eligible_fonts) * images_per_font
     max_reused_chunks = int(target_images * max(0.0, max_chunk_reuse_ratio))
     image_id = 1
@@ -347,21 +406,31 @@ def make_per_font_plan_rows(
             continue
         font_info = FontPlanInfo(font=font, split=split)
         made = 0
-        for _ in range(images_per_font):
+        for slot in range(images_per_font):
             chunk = None
-            for allow_reuse in (False, True):
-                chunk = next_chunk_for_font(
-                    font_info,
-                    chunks,
-                    supported,
-                    used_font_chunks,
-                    chunk_split,
-                    chunk_use_counts,
-                    reused_chunk_ids,
-                    max_reused_chunks,
-                    cursors,
-                    allow_reuse=allow_reuse,
-                )
+            requested_tier = "normal" if slot % 2 == 0 else "difficult"
+            candidate_tiers = (
+                ("difficult", "relative_difficult")
+                if requested_tier == "difficult"
+                else ("normal", "difficult")
+            )
+            for tier in candidate_tiers:
+                for allow_reuse in (False, True):
+                    chunk = next_chunk_for_font(
+                        font_info,
+                        difficulty_pools[tier],
+                        supported,
+                        used_font_chunks,
+                        chunk_split,
+                        chunk_use_counts,
+                        reused_chunk_ids,
+                        max_reused_chunks,
+                        cursors,
+                        tier=tier,
+                        allow_reuse=allow_reuse,
+                    )
+                    if chunk is not None:
+                        break
                 if chunk is not None:
                     break
             if chunk is None:
@@ -379,6 +448,8 @@ def make_per_font_plan_rows(
                     font=font,
                     script=script,
                     split=split,
+                    requested_text_difficulty_tier=requested_tier,
+                    selected_pool=tier,
                 )
             )
             image_id += 1
@@ -419,7 +490,7 @@ def make_per_font_plan_rows(
     if oversample_ume_dense:
         oversample_ume_dense_rows(
             rows,
-            chunks=chunks,
+            chunks=[*difficulty_pools["difficult"], *difficulty_pools["normal"]],
             supported=supported,
             fonts={font.basename: font for font in eligible_fonts},
             used_font_chunks=used_font_chunks,
@@ -445,7 +516,7 @@ def make_plan_rows(
     ]
     split_by_font_name = assign_font_splits(eligible_fonts, supported, rng)
 
-    chunks = sorted(chunks, key=lambda row: float(row["stack_difficulty_score"]), reverse=True)
+    difficulty_pools = build_difficulty_pools(chunks)
     categories = sorted({font.script_category for font in eligible_fonts})
     quotas = category_quotas(categories, target_images)
 
@@ -467,7 +538,8 @@ def make_plan_rows(
     chunk_split: dict[str, str] = {}
     chunk_use_counts: Counter[str] = Counter()
     reused_chunk_ids: set[str] = set()
-    cursors: dict[tuple[str, str, bool], int] = {}
+    cursors: dict[tuple[str, str, str, bool], int] = {}
+    difficulty_counts_by_font: dict[str, Counter[str]] = defaultdict(Counter)
     max_reused_chunks = int(target_images * max(0.0, max_chunk_reuse_ratio))
     image_id = 1
 
@@ -492,21 +564,37 @@ def make_plan_rows(
                     for font_info in font_infos:
                         if remaining <= 0:
                             break
-                        for allow_reuse in (False, True):
-                            chunk = next_chunk_for_font(
-                                font_info,
-                                chunks,
-                                supported,
-                                used_font_chunks,
-                                chunk_split,
-                                chunk_use_counts,
-                                reused_chunk_ids,
-                                max_reused_chunks,
-                                cursors,
-                                allow_reuse=allow_reuse,
-                            )
-                            if chunk is None:
-                                continue
+                        font_counts = difficulty_counts_by_font[font_info.font.basename]
+                        requested_tier = (
+                            "normal"
+                            if font_counts["normal"] <= font_counts["difficult"]
+                            else "difficult"
+                        )
+                        chunk = None
+                        for tier in (
+                            ("difficult", "relative_difficult")
+                            if requested_tier == "difficult"
+                            else ("normal", "difficult")
+                        ):
+                            for allow_reuse in (False, True):
+                                chunk = next_chunk_for_font(
+                                    font_info,
+                                    difficulty_pools[tier],
+                                    supported,
+                                    used_font_chunks,
+                                    chunk_split,
+                                    chunk_use_counts,
+                                    reused_chunk_ids,
+                                    max_reused_chunks,
+                                    cursors,
+                                    tier=tier,
+                                    allow_reuse=allow_reuse,
+                                )
+                                if chunk is not None:
+                                    break
+                            if chunk is not None:
+                                break
+                        if chunk is not None:
                             font = font_info.font
                             chunk_id = str(chunk["chunk_id"])
                             used_font_chunks.add((font.basename, chunk_id))
@@ -514,6 +602,7 @@ def make_plan_rows(
                             chunk_use_counts[chunk_id] += 1
                             if chunk_use_counts[chunk_id] > 1:
                                 reused_chunk_ids.add(chunk_id)
+                            difficulty_counts_by_font[font.basename][requested_tier] += 1
                             rows.append(
                                 _plan_row_dict(
                                     image_id=image_id,
@@ -521,13 +610,14 @@ def make_plan_rows(
                                     font=font,
                                     script=script,
                                     split=split,
+                                    requested_text_difficulty_tier=requested_tier,
+                                    selected_pool=tier,
                                 )
                             )
                             image_id += 1
                             remaining -= 1
                             progress.update(1)
                             made_progress = True
-                            break
                     if not made_progress:
                         print(
                             f"WARNING: {category}/{script}/{split} short by {remaining} image(s); "
@@ -561,7 +651,7 @@ def make_plan_rows(
     if oversample_ume_dense:
         oversample_ume_dense_rows(
             rows,
-            chunks=chunks,
+            chunks=[*difficulty_pools["difficult"], *difficulty_pools["normal"]],
             supported=supported,
             fonts={font.basename: font for font in eligible_fonts},
             used_font_chunks=used_font_chunks,
@@ -647,6 +737,18 @@ def write_summary(rows: list[dict[str, object]], output: Path) -> None:
         "script_id": Counter(row["script_id"] for row in rows),
         "basename": Counter(row["basename"] for row in rows),
         "font_name": Counter(row["font_name"] for row in rows),
+        "source_text_difficulty_tier": Counter(
+            row["source_text_difficulty_tier"] for row in rows
+        ),
+        "source_text_rarity_tier": Counter(
+            row["source_text_rarity_tier"] for row in rows
+        ),
+        "source_text_difficulty_basis": Counter(
+            row["source_text_difficulty_basis"] for row in rows
+        ),
+        "font_text_difficulty_tier": Counter(
+            f"{row['basename']}|{row['source_text_difficulty_tier']}" for row in rows
+        ),
     }
     reused_chunks = sum(1 for _chunk_id, count in Counter(row["chunk_id"] for row in rows).items() if count > 1)
     unique_chunks = len({row["chunk_id"] for row in rows})
