@@ -26,7 +26,7 @@ That review changed the policy:
 
 ## Ink and printing
 
-The first gallery shows effects on the same clean page:
+The following crops show effects on the same clean page:
 
 - **bleed-through:** faint, offset ink from the reverse side;
 - **ink bleed:** local spreading and thickening around strokes;
@@ -34,7 +34,25 @@ The first gallery shows effects on the same clean page:
 - **dirty drum:** streaks and localized printer/scanner dirt;
 - **dithering:** reduced tonal resolution, kept uncommon.
 
-![Original and selected local ink effects](assets/05-image-augmentation/local_ink.jpg)
+The center crop of the clean source:
+
+![High-resolution center crop of the original clean page](assets/05-image-augmentation/original.jpg)
+
+Medium bleed-through:
+
+![Center crop with medium bleed-through](assets/05-image-augmentation/bleedthrough.jpg)
+
+Medium ink bleed:
+
+![Center crop with medium ink bleed](assets/05-image-augmentation/inkbleed.jpg)
+
+Medium letterpress variation:
+
+![Center crop with uneven letterpress ink](assets/05-image-augmentation/letterpress.jpg)
+
+Mild dirty-drum marks:
+
+![Center crop with mild dirty-drum marks](assets/05-image-augmentation/dirtydrum.jpg)
 
 The production pool favors mild and medium strengths. Strong dirty-drum and ink-bleed examples were useful as rejection boundaries, especially because thin ume strokes fail earlier than uchen.
 
@@ -46,9 +64,19 @@ Hollowing remains in the policy at only about **0.2% of all pages**, with a weak
 
 Subtle noise and multi-scale noise texture are the safest frequent effects. They break the perfectly flat digital background without changing the text geometry.
 
-![Paper color, noise texture, and subtle noise](assets/05-image-augmentation/paper_and_noise.jpg)
-
 ColorPaper is assigned to roughly **2.7% of pages**. When document augmentation is enabled, all images are therefore saved as RGB JPEGs—even the uncolored ones—so this rare tint is not silently discarded by a final grayscale conversion. Runs without document augmentation keep the old grayscale output.
+
+Medium paper color:
+
+![Center crop with medium paper color](assets/05-image-augmentation/colorpaper.jpg)
+
+Medium multi-scale noise texture:
+
+![Center crop with medium paper noise texture](assets/05-image-augmentation/noisetexturize.jpg)
+
+Medium subtle noise:
+
+![Center crop with medium subtle noise](assets/05-image-augmentation/subtlenoise.jpg)
 
 Noise texture deserves one implementation footnote: Augraphy repeatedly adds noise at decreasing spatial scales. Its `turbulence` value must remain at least 2; a value of 1 never reduces the scale and loops indefinitely. Our reviewed ranges avoid that corner.
 
@@ -58,7 +86,17 @@ Noise texture deserves one implementation footnote: Augraphy repeatedly adds noi
 
 InkShifter applies a low-amplitude displacement field to the ink. It gives locally wandering strokes without moving the entire page. Folding adds a narrow brightness/deformation band. Although folding is geometrical, we keep a mild version here because it is local and visually easy to audit; the broader geometry study comes later.
 
-![InkShifter, folding, and medium Gaussian blur](assets/05-image-augmentation/spatial_and_blur.jpg)
+Medium InkShifter:
+
+![Center crop with medium InkShifter displacement](assets/05-image-augmentation/inkshifter.jpg)
+
+Medium folding:
+
+![Center crop crossing a medium fold](assets/05-image-augmentation/folding.jpg)
+
+Medium Gaussian blur:
+
+![Center crop with medium Gaussian blur](assets/05-image-augmentation/gaussian_blur.jpg)
 
 Initial rates, balanced independently within every source font:
 
@@ -91,7 +129,7 @@ The assignment is seeded by source font, face index, and image id. Every output 
 
 ## The whole pipeline together
 
-The gallery below is not a Photoshop montage. These pages were produced by the real renderer with:
+The samples below are not Photoshop mock-ups. These pages were produced by the real renderer with:
 
 ```text
 BoCorpus text
@@ -104,9 +142,19 @@ BoCorpus text
     → RGB JPEG + transcription + provenance
 ```
 
-The labels list the font-outline parameters and visible image effects. Some pages also contain coverage-checked shorthand substitutions.
+The samples combine font-outline parameters, local image effects, spatial effects, blur, and—in some pages—coverage-checked shorthand substitutions.
 
-![Six pages produced with the combined font, shorthand, and image augmentation pipeline](assets/05-image-augmentation/combined_pipeline.jpg)
+Aathup with a generated font variant, noise texture, InkShifter, medium blur, and shorthand substitutions:
+
+![High-resolution combined-pipeline Aathup crop](assets/05-image-augmentation/combined_02.jpg)
+
+Amdo Classic 2 with a generated font variant, ink bleed, folding, and medium blur:
+
+![High-resolution combined-pipeline Amdo Classic 2 crop](assets/05-image-augmentation/combined_05.jpg)
+
+Amdo Classic 4 with a generated font variant, subtle noise, InkShifter, and mild blur:
+
+![High-resolution combined-pipeline Amdo Classic 4 crop](assets/05-image-augmentation/combined_07.jpg)
 
 This is the main reason for keeping the stages separate in code and metadata: if one combination hurts OCR, we can identify whether the problem came from the text, font outline, ink simulation, spatial shift, or blur.
 

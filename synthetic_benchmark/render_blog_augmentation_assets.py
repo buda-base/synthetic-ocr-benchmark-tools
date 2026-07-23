@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import csv
+import random
 import textwrap
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -27,6 +30,20 @@ def save_resized(source: Path, destination: Path, *, width: int) -> None:
         image = image.convert("RGB")
         height = round(width * image.height / image.width)
         image.resize((width, height), Image.Resampling.LANCZOS).save(destination, quality=92)
+
+
+def save_center_square(image: Image.Image, destination: Path, *, fraction: float = 0.88) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image = image.convert("RGB")
+    side = round(min(image.width, image.height) * fraction)
+    left = (image.width - side) // 2
+    top = max(0, (image.height - side) // 2 - round(image.height * 0.03))
+    image.crop((left, top, left + side, top + side)).save(destination, quality=94)
+
+
+def crop_center_square(source: Path, destination: Path) -> None:
+    with Image.open(source) as image:
+        save_center_square(image, destination)
 
 
 def montage(
@@ -87,48 +104,39 @@ def build_part4_assets() -> None:
 
 
 def build_part5_type_assets() -> None:
-    review = OUT_DIR / "document_augmentation_review"
     source = REPO_ROOT / "blog" / "assets" / "02-rendering" / "pecha_uchen_example.jpg"
-    samples = review / "pecha_uchen_example"
     destination = BLOG_ASSETS / "05-image-augmentation"
-    montage(
-        [
-            ("Original", source),
-            ("Bleed-through · medium", samples / "bleedthrough__medium.jpg"),
-            ("Ink bleed · medium", samples / "inkbleed__medium.jpg"),
-            ("Letterpress · medium", samples / "letterpress__medium.jpg"),
-            ("Dirty drum · mild", samples / "dirtydrum__mild.jpg"),
-            ("Dithering · mild", samples / "dithering__mild.jpg"),
-        ],
-        destination / "local_ink.jpg",
-        columns=3,
-        cell_width=800,
-        image_height=230,
+    from render_document_augmentation_audit import _factories, apply_effect
+
+    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read {source}")
+    save_center_square(
+        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
+        destination / "original.jpg",
     )
-    montage(
-        [
-            ("Original", source),
-            ("Color paper · medium", samples / "colorpaper__medium.jpg"),
-            ("Noise texture · medium", samples / "noisetexturize__medium.jpg"),
-            ("Subtle noise · medium", samples / "subtlenoise__medium.jpg"),
-        ],
-        destination / "paper_and_noise.jpg",
-        columns=2,
-        cell_width=1050,
-        image_height=280,
-    )
-    montage(
-        [
-            ("Original", source),
-            ("InkShifter · medium", samples / "inkshifter__medium.jpg"),
-            ("Folding · medium", samples / "folding__medium.jpg"),
-            ("Gaussian blur · medium", samples / "gaussian_blur__medium.jpg"),
-        ],
-        destination / "spatial_and_blur.jpg",
-        columns=2,
-        cell_width=1050,
-        image_height=280,
-    )
+    selected = {
+        "bleedthrough": "medium",
+        "inkbleed": "medium",
+        "letterpress": "medium",
+        "dirtydrum": "mild",
+        "colorpaper": "medium",
+        "noisetexturize": "medium",
+        "subtlenoise": "medium",
+        "inkshifter": "medium",
+        "folding": "medium",
+        "gaussian_blur": "medium",
+    }
+    factories = _factories()
+    for index, (name, strength) in enumerate(selected.items()):
+        sample_seed = 5000 + index
+        random.seed(sample_seed)
+        np.random.seed(sample_seed)
+        output = apply_effect(image, factories[name][strength]())
+        save_center_square(
+            Image.fromarray(cv2.cvtColor(output, cv2.COLOR_BGR2RGB)),
+            destination / f"{name}.jpg",
+        )
 
 
 def load_combined_rows(root: Path) -> list[dict[str, str]]:
@@ -137,36 +145,6 @@ def load_combined_rows(root: Path) -> list[dict[str, str]]:
         with csv_path.open(encoding="utf-8", newline="") as stream:
             rows.extend(csv.DictReader(stream))
     return sorted(rows, key=lambda row: int(row["output_sequence"]))
-
-
-def combined_label(row: dict[str, str]) -> str:
-    parts = [row.get("font_name") or "font"]
-    for spec in (row.get("font_augmentation_specs") or "").split("|"):
-        replacements = (
-            ("vertical_stroke_", "v-stroke "),
-            ("horizontal_stroke_", "h-stroke "),
-            ("width_", "width "),
-            ("slant_", "slant "),
-        )
-        for source, replacement in replacements:
-            if spec.startswith(source):
-                spec = spec.replace(source, replacement, 1)
-                break
-        if spec:
-            parts.append(spec)
-    local = row.get("document_augmentation_local") or ""
-    if local:
-        parts.append(f"{local} {row.get('document_augmentation_local_strength')}")
-    spatial = row.get("document_augmentation_spatial") or ""
-    if spatial:
-        parts.append(f"{spatial} {row.get('document_augmentation_spatial_strength')}")
-    blur = row.get("document_augmentation_blur") or ""
-    if blur:
-        parts.append(f"blur {blur}")
-    shorthand_count = int(row.get("shorthand_count") or 0)
-    if shorthand_count:
-        parts.append(f"{shorthand_count} shorthands")
-    return " · ".join(parts)
 
 
 def build_combined_asset() -> None:
@@ -184,8 +162,9 @@ def build_combined_asset() -> None:
     )
     finished_dir = OUT_DIR / "blog_part5_combined_finishing"
     finished_dir.mkdir(parents=True, exist_ok=True)
-    cells = []
     for row, (spatial, spatial_strength, blur) in zip(rows, forced_finishing):
+        if int(row["output_sequence"]) not in {2, 5, 7}:
+            continue
         apply_row = dict(row)
         # The source JPEG already contains its assigned local appearance effect.
         apply_row["document_augmentation_local"] = ""
@@ -200,18 +179,12 @@ def build_combined_asset() -> None:
             apply_row,
             jpeg_quality=88,
         )
-        display_row = dict(row)
-        display_row["document_augmentation_spatial"] = spatial
-        display_row["document_augmentation_spatial_strength"] = spatial_strength
-        display_row["document_augmentation_blur"] = blur
-        cells.append((combined_label(display_row), output))
-    montage(
-        cells,
-        BLOG_ASSETS / "05-image-augmentation" / "combined_pipeline.jpg",
-        columns=2,
-        cell_width=1200,
-        image_height=330,
-    )
+        crop_center_square(
+            output,
+            BLOG_ASSETS
+            / "05-image-augmentation"
+            / f"combined_{int(row['output_sequence']):02d}.jpg",
+        )
 
 
 def main() -> None:
