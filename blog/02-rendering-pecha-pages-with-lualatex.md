@@ -82,6 +82,21 @@ bigram fraction. The requested policy and measured score are retained as
 `source_text_repetition_score`, so downstream audits can distinguish deliberate
 repetition coverage from accidental repetition.
 
+Rare text is selected for **coverage**, rather than repeatedly taking whichever
+chunks have the highest global difficulty score. For each font face, the planner
+remembers the rare stacks already selected. For a difficult slot it examines up
+to 96 compatible candidates and prefers chunks that introduce previously unseen
+rare stacks for that font.
+
+The ranking gives most weight to the number and rarity of newly covered stacks,
+while retaining smaller terms for the requested repetition behavior and overall
+chunk difficulty. After selection, the chunk's rare stacks enter that font's
+covered set, changing the ranking for the next page. This greedy update spreads
+difficult examples across distinct forms instead of concentrating pages around
+the same few rare stacks. Coverage gains and newly introduced stack counts are
+stored in the render plan for auditing. A concise description is available in
+[`selection_method.md`](../selection_method.md).
+
 At render time, chunks that overflow a physical page contribute only their **first** page to the benchmark; short underfull pages can be merged with the next chunk and re-rendered. Failures are logged per batch; successful batches checkpoint so long runs are resumable.
 
 ---
