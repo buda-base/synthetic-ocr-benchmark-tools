@@ -29,9 +29,11 @@ from synthetic_common import (
     load_font_catalog,
     load_stack_rarity_scores,
     load_supported_stacks,
+    rarity_equivalent_stack,
     stack_difficulty_score,
     tokenize_tibetan_stacks,
 )
+from selection_coverage_report import write_selection_coverage_report
 
 GROUP_SIZE = 1000
 SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
@@ -108,16 +110,19 @@ def load_chunks(path: Path) -> list[dict[str, object]]:
     for chunk in tqdm(chunks, desc="Load chunk difficulty", unit="chunk"):
         stack_text = chunk.get("stacks") or ""
         chunk["_stack_set"] = frozenset(str(stack_text).split())
-        chunk["_rare_stack_set"] = frozenset(
-            stack
-            for stack in chunk["_stack_set"]
-            if has_tibetan_letter(stack)
-            and rarity_by_stack.get(stack, 1.0) >= RARE_STACK_THRESHOLD
-        )
-        chunk["_rare_stack_weight"] = {
-            stack: rarity_by_stack.get(stack, 1.0)
-            for stack in chunk["_rare_stack_set"]
-        }
+        rare_stack_weights: dict[str, float] = {}
+        for stack in chunk["_stack_set"]:
+            if not has_tibetan_letter(stack):
+                continue
+            equivalent = rarity_equivalent_stack(stack)
+            rarity = rarity_by_stack.get(stack, rarity_by_stack.get(equivalent, 1.0))
+            if rarity >= RARE_STACK_THRESHOLD:
+                rare_stack_weights[equivalent] = max(
+                    rarity,
+                    rare_stack_weights.get(equivalent, 0.0),
+                )
+        chunk["_rare_stack_set"] = frozenset(rare_stack_weights)
+        chunk["_rare_stack_weight"] = rare_stack_weights
         if chunk.get("stack_difficulty_score") is None:
             chunk["stack_difficulty_score"] = stack_difficulty_score(str(chunk.get("text") or ""))
         else:
@@ -1030,8 +1035,16 @@ def main() -> None:
     pq.write_table(table, args.output, compression="zstd")
     summary = args.summary_csv or args.output.with_suffix(".summary.csv")
     write_summary(rows, summary)
+    report_paths = write_selection_coverage_report(
+        rows=rows,
+        chunks=chunks,
+        fonts=fonts,
+        supported=supported,
+        output_plan=args.output,
+    )
     print(f"Wrote {args.output} ({len(rows)} image plan row(s))")
     print(f"Wrote {summary}")
+    print("Wrote stack selection reports: " + ", ".join(map(str, report_paths)))
 
 
 if __name__ == "__main__":

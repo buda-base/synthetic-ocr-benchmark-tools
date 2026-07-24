@@ -97,6 +97,11 @@ the same few rare stacks. Coverage gains and newly introduced stack counts are
 stored in the render plan for auditing. A concise description is available in
 [`selection_method.md`](../selection_method.md).
 
+For rarity and novelty only, stacks containing `༵` or `༷` are folded into their
+unmarked base stack. The marks remain in the rendered text, but they no longer
+manufacture hundreds of nominally rare variants at the expense of mantra and
+other structurally complex stacks.
+
 At render time, chunks that overflow a physical page contribute only their **first** page to the benchmark; short underfull pages can be merged with the next chunk and re-rendered. Failures are logged per batch; successful batches checkpoint so long runs are resumable.
 
 ---

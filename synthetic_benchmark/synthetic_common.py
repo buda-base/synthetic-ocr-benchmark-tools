@@ -42,6 +42,7 @@ TOC_TSHIG_RUN = TSHEG * 5
 EXCLUDED_SCRIPT_IDS = {"239"}
 DIFFICULTY_TOP_K = 10
 RARE_STACK_THRESHOLD = 0.8
+RARITY_IGNORED_MARKS = frozenset({"\u0f35", "\u0f37"})
 
 
 @dataclass(frozen=True)
@@ -124,9 +125,15 @@ def has_tibetan_letter(stack: str) -> bool:
     return any(unicodedata.category(ch).startswith("L") for ch in stack)
 
 
+def rarity_equivalent_stack(stack: str) -> str:
+    """Remove annotation marks that should not create independent rarity."""
+    return "".join(char for char in stack if char not in RARITY_IGNORED_MARKS)
+
+
 @lru_cache(maxsize=4)
 def load_stack_rarity_scores(stacks_csv: str = str(DEFAULT_STACKS_CSV)) -> dict[str, float]:
-    """Load corpus stack counts and map each stack to a percentile-clipped rarity in [0, 1]."""
+    """Map stacks to rarity after merging annotation-mark variants."""
+    raw_to_equivalent: dict[str, str] = {}
     counts: dict[str, int] = {}
     with Path(stacks_csv).open(encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
@@ -135,7 +142,9 @@ def load_stack_rarity_scores(stacks_csv: str = str(DEFAULT_STACKS_CSV)) -> dict[
                 continue
             count = parse_int(row.get("nb_occurences") or row.get("nb_occurrences"), 0)
             if count > 0:
-                counts[stack] = count
+                equivalent = rarity_equivalent_stack(stack)
+                raw_to_equivalent[stack] = equivalent
+                counts[equivalent] = counts.get(equivalent, 0) + count
     if not counts:
         return {}
 
@@ -145,11 +154,19 @@ def load_stack_rarity_scores(stacks_csv: str = str(DEFAULT_STACKS_CSV)) -> dict[
     hi = infos[int(0.95 * (len(infos) - 1))]
     scale = hi - lo
     if scale <= 0:
-        return {stack: 0.0 for stack in counts}
+        equivalent_scores = {stack: 0.0 for stack in counts}
+        return equivalent_scores | {
+            stack: equivalent_scores[equivalent]
+            for stack, equivalent in raw_to_equivalent.items()
+        }
 
-    return {
+    equivalent_scores = {
         stack: min(1.0, max(0.0, ((-math.log(count / total)) - lo) / scale))
         for stack, count in counts.items()
+    }
+    return equivalent_scores | {
+        stack: equivalent_scores[equivalent]
+        for stack, equivalent in raw_to_equivalent.items()
     }
 
 
@@ -175,8 +192,12 @@ def stack_difficulty_score(
     rarity_by_stack = load_stack_rarity_scores(str(stacks_csv))
     rarities = [rarity_by_stack.get(stack, 1.0) for stack in stacks]
     rare_tokens = [value for value in rarities if value >= rare_threshold]
-    unique_stacks = set(stacks)
-    unique_rare_count = sum(1 for stack in unique_stacks if rarity_by_stack.get(stack, 1.0) >= rare_threshold)
+    unique_stacks = {rarity_equivalent_stack(stack) for stack in stacks}
+    unique_rare_count = sum(
+        1
+        for stack in unique_stacks
+        if rarity_by_stack.get(stack, 1.0) >= rare_threshold
+    )
 
     top_values = sorted(rarities, reverse=True)[: max(1, top_k)]
     top_k_mean = sum(top_values) / len(top_values)

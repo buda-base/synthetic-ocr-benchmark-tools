@@ -17,6 +17,11 @@ The ranking balances:
 - the requested low- or high-repetition behavior;
 - the chunk's overall difficulty.
 
+The annotation marks `༵` and `༷` do not create separate rarity identities.
+Their corpus counts and coverage are merged with the corresponding unmarked
+stack, so heavily annotated passages cannot consume the rare-stack budget merely
+by producing many marked variants.
+
 Coverage is tracked separately for each font because a stack rendered by one
 font does not test another font. The candidate must also respect font support,
 dataset split boundaries, and reuse limits.

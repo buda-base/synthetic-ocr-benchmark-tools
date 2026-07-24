@@ -26,6 +26,7 @@ from synthetic_common import (
     load_supported_stacks,
 )
 from build_render_plan import load_chunks
+from selection_coverage_report import write_selection_coverage_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,9 +110,10 @@ def main() -> None:
         math.ceil(target_per_script / face_counts[script])
         for script in ("uchen", "ume")
     )
+    chunks = load_chunks(args.chunks)
     rows = make_per_font_plan_rows(
         fonts=eligible,
-        chunks=load_chunks(args.chunks),
+        chunks=chunks,
         supported=supported,
         images_per_font=images_per_font,
         seed=args.seed,
@@ -133,6 +135,13 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(selected), args.output, compression="zstd")
     write_summary(selected, args.output.with_suffix(".summary.csv"))
+    report_paths = write_selection_coverage_report(
+        rows=selected,
+        chunks=chunks,
+        fonts=eligible,
+        supported=supported,
+        output_plan=args.output,
+    )
 
     selected_counts = Counter(str(row["script"]) for row in selected)
     selected_faces = Counter(
@@ -158,6 +167,7 @@ def main() -> None:
         f"Wrote {len(selected)} rows to {args.output}; scripts={dict(selected_counts)}; "
         f"eligible_faces={dict(face_counts)}; pages_per_face={ranges}"
     )
+    print("Wrote stack selection reports: " + ", ".join(map(str, report_paths)))
 
 
 if __name__ == "__main__":
