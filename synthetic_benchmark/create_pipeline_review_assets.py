@@ -185,11 +185,21 @@ def write_review_manifest(
         "source_text_repetition_score",
         "source_text_repetition_policy",
         "source_text_repetition_basis",
+        "source_text_new_rare_stack_count",
+        "source_text_rare_stack_count",
+        "source_text_rarity_coverage_gain",
+        "source_text_coverage_selection_score",
         "document_augmentation_local",
         "document_augmentation_spatial",
         "document_augmentation_tps_strength",
         "document_augmentation_rotation_deg",
         "document_augmentation_blur",
+        "raster_naturalization_profile",
+        "raster_naturalization_seed",
+        "raster_naturalization_blur_sigma",
+        "raster_naturalization_white_dropout_rate",
+        "raster_naturalization_luminance_noise_sigma",
+        "raster_naturalization_displacement_px",
     ]
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)

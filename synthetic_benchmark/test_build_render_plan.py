@@ -32,6 +32,12 @@ def sample_chunks() -> list[dict[str, object]]:
                 "unique_stack_count": 1,
                 "stacks": f"stack-{index}",
                 "_stack_set": frozenset({f"stack-{index}"}),
+                "_rare_stack_set": (
+                    frozenset({f"stack-{index}"}) if difficult else frozenset()
+                ),
+                "_rare_stack_weight": (
+                    {f"stack-{index}": 0.9} if difficult else {}
+                ),
                 "stack_difficulty_score": 0.5 if difficult else 0.0,
                 "text_repetition_score": (index % 10) / 10,
             }
@@ -120,6 +126,44 @@ class RenderPlanDifficultyTests(unittest.TestCase):
         self.assertGreater(
             text_repetition_score(repeated),
             text_repetition_score(diverse),
+        )
+
+    def test_difficult_selection_expands_rare_stack_coverage(self) -> None:
+        chunks = sample_chunks()
+        difficult = [chunk for chunk in chunks if chunk["stack_difficulty_score"]]
+        difficult[0]["_rare_stack_set"] = frozenset({"rare-a"})
+        difficult[0]["_rare_stack_weight"] = {"rare-a": 0.9}
+        difficult[1]["_rare_stack_set"] = frozenset({"rare-a"})
+        difficult[1]["_rare_stack_weight"] = {"rare-a": 0.9}
+        difficult[2]["_rare_stack_set"] = frozenset({"rare-b"})
+        difficult[2]["_rare_stack_weight"] = {"rare-b": 0.95}
+        font = sample_font()
+        supported = {font.basename: {f"stack-{index}" for index in range(20)}}
+        rows = make_per_font_plan_rows(
+            fonts=[font],
+            chunks=chunks,
+            supported=supported,
+            images_per_font=4,
+            seed=13,
+            max_chunk_reuse_ratio=0.10,
+        )
+        difficult_rows = [
+            row for row in rows if row["source_text_difficulty_tier"] == "difficult"
+        ]
+        self.assertEqual(len(difficult_rows), 2)
+        self.assertTrue(
+            all(row["source_text_new_rare_stack_count"] >= 1 for row in difficult_rows)
+        )
+        self.assertEqual(
+            sum(row["source_text_new_rare_stack_count"] for row in difficult_rows),
+            2,
+        )
+        self.assertTrue(
+            all(
+                row["source_text_coverage_policy"]
+                == "bounded_greedy_rare_stack_coverage"
+                for row in difficult_rows
+            )
         )
 
     def test_fonts_without_rare_compatible_stacks_use_relative_difficulty(self) -> None:

@@ -98,13 +98,42 @@ Medium Gaussian blur:
 
 ![Center crop with medium Gaussian blur](assets/05-image-augmentation/gaussian_blur.jpg)
 
-Initial rates, balanced independently within every source font:
+The initial review rates, balanced independently within every source font, were:
 
 - **InkShifter:** 8% of pages, 75% mild and 25% medium;
 - **folding:** 3%, one fold, mostly mild;
 - **Gaussian blur:** 10%, mild or medium only—never strong.
 
 Blur is applied after the other selected effects, matching an optical/capture stage rather than an ink-generation stage.
+
+### A mandatory final raster pass
+
+Reviewing complete pages exposed a smaller but ubiquitous synthetic signal: even
+pages without a named Augraphy effect were too geometrically exact and too
+digitally sharp. The final policy therefore gives **every page** a conservative
+raster-naturalization pass. Profile A is the baseline; a balanced 15% subset of
+each font receives the stronger profile B.
+
+The pass applies, in order:
+
+1. a smooth local displacement field;
+2. sparse white dropout inside detected ink;
+3. Gaussian blur, which softens those white defects into imperfect ink transfer;
+4. low-amplitude luminance noise.
+
+At final output resolution, profile A uses 0.6–1.2 px RMS local displacement,
+0.35–0.65 px blur, and white dropout on 3–6% of detected ink candidates.
+Profile B uses 1.2–2.5 px displacement, 0.50–0.90 px blur, and 7–14% dropout.
+The displacement field varies over small local regions rather than shifting a
+line or page as a rigid object.
+
+The same crop before naturalization, with profile A, and with profile B:
+
+![Original crop compared with raster-naturalization profiles A and B](assets/05-image-augmentation/raster_naturalization_profiles.png)
+
+This pass is deliberately late in the pipeline. The white defects belong to the
+ink, so they are drawn before blur; the final luminance noise belongs to capture,
+so it is added afterward.
 
 ---
 
@@ -121,7 +150,10 @@ Within those selected pages, the weighted pool currently favors:
 5. occasional dithering and paper color;
 6. extremely rare hollowing.
 
-InkShifter, folding, and blur are assigned independently, so a page may receive one local appearance effect plus one spatial effect and blur. The strongest levels are never used for those combinations.
+InkShifter and folding are assigned independently, so a page may receive one
+local appearance effect plus one spatial effect. Mandatory raster
+naturalization then runs on every page, and its independently recorded profile
+keeps those combinations auditable.
 
 The assignment is seeded by source font, face index, and image id. Every output catalog row records the selected effects, strengths, and seed, and the run writes a complete `document_augmentation_manifest.json`.
 
@@ -138,7 +170,7 @@ BoCorpus text
     → LuaLaTeX / HarfBuzz pecha page
     → local ink or paper effect
     → optional InkShifter or fold
-    → optional mild/medium blur
+    → mandatory raster naturalization (A, or B on 15%)
     → RGB JPEG + transcription + provenance
 ```
 

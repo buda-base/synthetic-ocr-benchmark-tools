@@ -293,12 +293,15 @@ def load_font_catalog(
     exclude_script_ids = exclude_script_ids or EXCLUDED_SCRIPT_IDS
     scripts = load_scripts(scripts_csv)
     font_meta = load_font_size_map(fonts_csv)
+    restrict_to_font_meta = fonts_csv.exists()
     rows: list[FontCatalogRow] = []
     with benchmark_csv.open(encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             script_id = row.get("script id", "").strip()
             font_path = row.get("font_path", "").strip()
             if not font_path or not script_id or script_id in exclude_script_ids:
+                continue
+            if restrict_to_font_meta and font_path not in font_meta:
                 continue
             meta = scripts.get(script_id, {})
             size_meta = font_meta.get(font_path, {})

@@ -12,9 +12,11 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from document_augmentation import (
+    _apply_raster_naturalization,
     _apply_vertical_tps,
     apply_document_augmentations,
     assign_document_augmentations,
+    assign_raster_naturalization,
     enforce_background_readability_for_line_count,
 )
 from paper_backgrounds import PaperBackground
@@ -114,8 +116,49 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertNotIn("lowlightnoise", local_effects)
         self.assertNotIn("linesdegradation", local_effects)
         self.assertTrue(
-            all(row["document_augmentation_blur"] in {"", "mild", "medium"} for row in first)
+            all(row["document_augmentation_blur"] in {"mild", "medium"} for row in first)
         )
+        self.assertEqual(
+            Counter(row["raster_naturalization_profile"] for row in first),
+            Counter({"A": 255, "B": 45}),
+        )
+
+    def test_raster_naturalization_is_deterministic_and_changes_ink(self) -> None:
+        image = np.full((160, 500), 255, dtype=np.uint8)
+        image[55:105, 80:420] = 20
+        row = {
+            "document_augmentation_seed": 1234,
+            "raster_naturalization_profile": "B",
+            "raster_naturalization_blur_sigma": 0.7,
+            "raster_naturalization_white_dropout_rate": 0.05,
+            "raster_naturalization_luminance_noise_sigma": 1.8,
+            "raster_naturalization_displacement_px": 0.6,
+        }
+        first = _apply_raster_naturalization(image, row)
+        second = _apply_raster_naturalization(image, row)
+        self.assertEqual(first.shape, image.shape)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertFalse(np.array_equal(first, image))
+        self.assertGreater(int(first[55:105, 80:420].max()), 20)
+
+    def test_raster_naturalization_is_assigned_without_document_effects(self) -> None:
+        first, manifest = assign_raster_naturalization(
+            sample_rows(fonts=2, images_per_font=20),
+            profile_b_rate=0.15,
+            seed=31,
+        )
+        second, _ = assign_raster_naturalization(
+            sample_rows(fonts=2, images_per_font=20),
+            profile_b_rate=0.15,
+            seed=31,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(
+            Counter(row["raster_naturalization_profile"] for row in first),
+            Counter({"A": 34, "B": 6}),
+        )
+        self.assertTrue(all(row["raster_naturalization_seed"] for row in first))
+        self.assertTrue(manifest["mandatory_on_all_renders"])
 
     def test_geometric_rates_are_balanced_per_font(self) -> None:
         prepared, manifest = assign_document_augmentations(

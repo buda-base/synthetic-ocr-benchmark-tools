@@ -146,6 +146,83 @@ def _sample_tps_parameters(seed: int, strength: str) -> tuple[float, list[float]
     return y_normalized, offsets.tolist()
 
 
+def _naturalization_parameters(profile: str, seed: int) -> dict[str, object]:
+    rng = random.Random(seed)
+    if profile == "B":
+        ranges = ((0.50, 0.90), (0.0700, 0.1400), (1.20, 2.20), (1.20, 2.50))
+    else:
+        ranges = ((0.35, 0.65), (0.0300, 0.0600), (0.60, 1.20), (0.60, 1.20))
+    blur, dropout, noise, displacement = (
+        rng.uniform(*value_range) for value_range in ranges
+    )
+    return {
+        "document_augmentation_blur": "medium" if profile == "B" else "mild",
+        "raster_naturalization_profile": profile,
+        "raster_naturalization_seed": seed,
+        "raster_naturalization_blur_sigma": round(blur, 6),
+        "raster_naturalization_white_dropout_rate": round(dropout, 8),
+        "raster_naturalization_luminance_noise_sigma": round(noise, 6),
+        "raster_naturalization_displacement_px": round(displacement, 6),
+    }
+
+
+def assign_raster_naturalization(
+    rows: list[dict[str, object]],
+    *,
+    profile_b_rate: float = 0.15,
+    seed: int = 13,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Assign mandatory profile A, with a balanced profile B subset, per font."""
+    if not 0.0 <= profile_b_rate <= 1.0:
+        raise ValueError("profile_b_rate must be in [0, 1]")
+    groups: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        groups[(str(row["basename"]), str(row.get("ttc_face_index") or ""))].append(row)
+    prepared: list[dict[str, object]] = []
+    font_summaries = []
+    for (basename, face_index), font_rows in sorted(groups.items()):
+        font_rows = sorted(font_rows, key=lambda item: int(item["image_id"]))
+        font_seed = _stable_seed(seed, basename, face_index)
+        profile_b_indices = _balanced_selection(
+            font_rows,
+            profile_b_rate,
+            seed=font_seed,
+            label="raster_naturalization_b",
+        )
+        for index, row in enumerate(font_rows):
+            item = dict(row)
+            profile = "B" if index in profile_b_indices else "A"
+            item.update(
+                _naturalization_parameters(
+                    profile,
+                    _stable_seed(font_seed, row["image_id"], "raster_naturalization"),
+                )
+            )
+            prepared.append(item)
+        font_summaries.append(
+            {
+                "basename": basename,
+                "source_face_index": face_index,
+                "images": len(font_rows),
+                "profile_a_images": len(font_rows) - len(profile_b_indices),
+                "profile_b_images": len(profile_b_indices),
+            }
+        )
+    prepared.sort(key=lambda item: int(item["image_id"]))
+    return prepared, {
+        "seed": seed,
+        "profile_b_rate": profile_b_rate,
+        "mandatory_on_all_renders": True,
+        "operation_order": [
+            "local_micro_distortion",
+            "white_ink_dropout",
+            "gaussian_blur",
+            "luminance_noise",
+        ],
+        "fonts": font_summaries,
+    }
+
+
 def _allowed_background_tiers(
     row: dict[str, object],
     *,
@@ -221,7 +298,8 @@ def assign_document_augmentations(
     synthetic_paper_rate: float = 0.30,
     inkshifter_rate: float = 0.08,
     folding_rate: float = 0.03,
-    blur_rate: float = 0.10,
+    blur_rate: float = 1.0,
+    naturalization_b_rate: float = 0.15,
     rotation_rate: float = 0.70,
     rotation_high_rate: float = 0.10,
     tps_rate: float = 0.30,
@@ -237,6 +315,7 @@ def assign_document_augmentations(
         ("inkshifter_rate", inkshifter_rate),
         ("folding_rate", folding_rate),
         ("blur_rate", blur_rate),
+        ("naturalization_b_rate", naturalization_b_rate),
         ("rotation_rate", rotation_rate),
         ("rotation_high_rate", rotation_high_rate),
         ("tps_rate", tps_rate),
@@ -254,6 +333,8 @@ def assign_document_augmentations(
         raise ValueError("tps_high_rate cannot exceed tps_rate")
     if tps_rate > rotation_rate:
         raise ValueError("tps_rate cannot exceed rotation_rate because TPS is assigned to rotated pages")
+    if naturalization_b_rate > blur_rate:
+        raise ValueError("naturalization_b_rate cannot exceed blur_rate")
 
     groups: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
@@ -289,6 +370,13 @@ def assign_document_augmentations(
         )
         folding_indices = {folding_candidates[i] for i in folding_selected}
         blur_indices = _balanced_selection(font_rows, blur_rate, seed=font_seed, label="blur")
+        naturalization_b_indices = _balanced_subselection(
+            font_rows,
+            blur_indices,
+            naturalization_b_rate,
+            seed=font_seed,
+            label="raster_naturalization_b",
+        )
         rotation_indices = _balanced_selection(
             font_rows, rotation_rate, seed=font_seed, label="rotation"
         )
@@ -457,13 +545,23 @@ def assign_document_augmentations(
                 item["document_augmentation_spatial_strength"] = ""
 
             if index in blur_indices:
-                item["document_augmentation_blur"] = (
-                    "mild"
-                    if random.Random(_stable_seed(font_seed, row["image_id"], "blur")).random() < 0.65
-                    else "medium"
+                profile = "B" if index in naturalization_b_indices else "A"
+                item.update(
+                    _naturalization_parameters(
+                        profile,
+                        _stable_seed(
+                            font_seed, row["image_id"], "raster_naturalization"
+                        ),
+                    )
                 )
             else:
                 item["document_augmentation_blur"] = ""
+                item["raster_naturalization_profile"] = ""
+                item["raster_naturalization_seed"] = ""
+                item["raster_naturalization_blur_sigma"] = ""
+                item["raster_naturalization_white_dropout_rate"] = ""
+                item["raster_naturalization_luminance_noise_sigma"] = ""
+                item["raster_naturalization_displacement_px"] = ""
 
             if index in rotation_indices:
                 rotation_strength = "high" if index in rotation_high_indices else "typical"
@@ -510,6 +608,7 @@ def assign_document_augmentations(
                 "inkshifter_images": len(ink_indices),
                 "folding_images": len(folding_indices),
                 "blur_images": len(blur_indices),
+                "raster_naturalization_b_images": len(naturalization_b_indices),
                 "rotation_images": len(rotation_indices),
                 "rotation_high_images": len(rotation_high_indices),
                 "tps_images": len(tps_indices),
@@ -529,6 +628,7 @@ def assign_document_augmentations(
             "inkshifter": inkshifter_rate,
             "folding": folding_rate,
             "blur": blur_rate,
+            "raster_naturalization_b": naturalization_b_rate,
             "rotation": rotation_rate,
             "rotation_high": rotation_high_rate,
             "tps": tps_rate,
@@ -567,6 +667,28 @@ def assign_document_augmentations(
             "tps_x_normalized": TPS_X_NORMALIZED.tolist(),
             "tps_regularization": TPS_REGULARIZATION,
             "tps_corner_anchors": "four fixed identity image corners",
+        },
+        "raster_naturalization_policy": {
+            "applied_after_document_and_geometric_effects": True,
+            "operation_order": [
+                "local_micro_distortion",
+                "white_ink_dropout",
+                "gaussian_blur",
+                "luminance_noise",
+            ],
+            "profile_a": {
+                "blur_sigma_px": [0.35, 0.65],
+                "white_dropout_fraction_of_ink": [0.0300, 0.0600],
+                "luminance_noise_sigma_255": [0.60, 1.20],
+                "local_displacement_px": [0.60, 1.20],
+            },
+            "profile_b": {
+                "rate": naturalization_b_rate,
+                "blur_sigma_px": [0.50, 0.90],
+                "white_dropout_fraction_of_ink": [0.0700, 0.1400],
+                "luminance_noise_sigma_255": [1.20, 2.20],
+                "local_displacement_px": [1.20, 2.50],
+            },
         },
         "fonts": font_summaries,
     }
@@ -771,6 +893,118 @@ def _apply_rotation(image: np.ndarray, angle_deg: float) -> np.ndarray:
     )
 
 
+def _apply_local_micro_distortion(
+    image: np.ndarray,
+    *,
+    displacement_px: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Apply a smooth subpixel displacement field at final output resolution."""
+    if displacement_px <= 0:
+        return image
+    height, width = image.shape[:2]
+    grid_height = max(3, int(np.ceil(height / 32)) + 2)
+    grid_width = max(3, int(np.ceil(width / 32)) + 2)
+    dx = cv2.resize(
+        rng.normal(size=(grid_height, grid_width)).astype(np.float32),
+        (width, height),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    dy = cv2.resize(
+        rng.normal(size=(grid_height, grid_width)).astype(np.float32),
+        (width, height),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    rms = max(
+        float(np.sqrt((np.square(dx).mean() + np.square(dy).mean()) / 2.0)),
+        1e-6,
+    )
+    limit = 2.5 * displacement_px
+    dx = np.clip(dx * displacement_px / rms, -limit, limit)
+    dy = np.clip(dy * displacement_px / rms, -limit, limit)
+    x, y = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+    return cv2.remap(
+        image,
+        x + dx,
+        y + dy,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _apply_white_ink_dropout(
+    image: np.ndarray,
+    *,
+    rate: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Partially whiten sparse ink pixels while leaving paper pixels untouched."""
+    if rate <= 0:
+        return image
+    grayscale = _to_ink_grayscale(image)
+    local_background = cv2.morphologyEx(
+        grayscale,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+    )
+    ink_mask = (local_background.astype(np.int16) - grayscale.astype(np.int16) >= 18) & (
+        grayscale < 225
+    )
+    candidates = np.flatnonzero(ink_mask)
+    count = min(len(candidates), max(0, round(len(candidates) * rate)))
+    if count == 0:
+        return image
+    selected = rng.choice(candidates, size=count, replace=False)
+    alpha = rng.uniform(0.55, 1.0, size=count).astype(np.float32)
+    alpha[rng.random(count) < 0.30] = 1.0
+    output = image.astype(np.float32, copy=True)
+    flattened = output.reshape(-1) if output.ndim == 2 else output.reshape(-1, output.shape[2])
+    if output.ndim == 2:
+        flattened[selected] += (255.0 - flattened[selected]) * alpha
+    else:
+        flattened[selected] += (255.0 - flattened[selected]) * alpha[:, None]
+    return np.clip(output, 0, 255).astype(np.uint8)
+
+
+def _apply_raster_naturalization(
+    image: np.ndarray,
+    row: dict[str, object],
+) -> np.ndarray:
+    """Apply mandatory profile A/B raster softening deterministically."""
+    profile = str(row.get("raster_naturalization_profile") or "")
+    if not profile:
+        return image
+    seed = int(
+        row.get("raster_naturalization_seed")
+        or row.get("document_augmentation_seed")
+        or 13
+    )
+    rng = np.random.default_rng(seed)
+    output = _apply_local_micro_distortion(
+        image,
+        displacement_px=float(row["raster_naturalization_displacement_px"]),
+        rng=rng,
+    )
+    output = _apply_white_ink_dropout(
+        output,
+        rate=float(row["raster_naturalization_white_dropout_rate"]),
+        rng=rng,
+    )
+    blur_sigma = float(row["raster_naturalization_blur_sigma"])
+    output = cv2.GaussianBlur(output, (0, 0), blur_sigma)
+    noise_sigma = float(row["raster_naturalization_luminance_noise_sigma"])
+    noise = rng.normal(0.0, noise_sigma, size=output.shape[:2]).astype(np.float32)
+    as_float = output.astype(np.float32)
+    if output.ndim == 2:
+        as_float += noise
+    else:
+        as_float += noise[:, :, None]
+    return np.clip(as_float, 0, 255).astype(np.uint8)
+
+
 def _save_benchmark_image(
     image: np.ndarray,
     destination: Path,
@@ -878,15 +1112,41 @@ def apply_document_augmentations(
         if rotation not in (None, ""):
             image = _apply_rotation(image, float(rotation))
 
-        blur = str(row.get("document_augmentation_blur") or "")
-        if blur:
-            kernel, sigma = (3, 0.45) if blur == "mild" else (5, 0.90)
-            image = cv2.GaussianBlur(image, (kernel, kernel), sigma)
+        image = _apply_raster_naturalization(image, row)
 
     _save_benchmark_image(
         image,
         destination,
         output_mode=output_mode,
+        jpeg_quality=int(row.get("output_jpeg_quality") or jpeg_quality),
+    )
+
+
+def apply_raster_naturalization(
+    source: Path,
+    destination: Path,
+    row: dict[str, object],
+    *,
+    jpeg_quality: int,
+) -> None:
+    """Naturalize a plain LuaLaTeX raster when document effects are disabled."""
+    image = cv2.imread(str(source), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Could not read rendered page: {source}")
+    output_width = int(row.get("output_width_px") or image.shape[1])
+    if output_width != image.shape[1]:
+        output_height = max(1, round(image.shape[0] * output_width / image.shape[1]))
+        interpolation = cv2.INTER_AREA if output_width < image.shape[1] else cv2.INTER_CUBIC
+        image = cv2.resize(
+            image,
+            (output_width, output_height),
+            interpolation=interpolation,
+        )
+    image = _apply_raster_naturalization(image, row)
+    _save_benchmark_image(
+        image,
+        destination,
+        output_mode="L",
         jpeg_quality=int(row.get("output_jpeg_quality") or jpeg_quality),
     )
 

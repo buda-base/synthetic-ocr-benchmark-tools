@@ -23,8 +23,11 @@ from synthetic_common import (
     DEFAULT_FONTS_CSV,
     DEFAULT_RENDER_PLAN,
     DEFAULT_SCRIPTS_CSV,
+    RARE_STACK_THRESHOLD,
     FontCatalogRow,
+    has_tibetan_letter,
     load_font_catalog,
+    load_stack_rarity_scores,
     load_supported_stacks,
     stack_difficulty_score,
     tokenize_tibetan_stacks,
@@ -34,6 +37,7 @@ GROUP_SIZE = 1000
 SPLIT_RATIOS = {"train": 0.8, "val": 0.1, "test": 0.1}
 SPLITS = tuple(SPLIT_RATIOS)
 TEXT_BOUNDARIES = re.compile(r"[\s\u0f0b\u0f0c\u0f0d-\u0f14]+")
+COVERAGE_LOOKAHEAD = 96
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,9 +104,20 @@ def font_name(font: FontCatalogRow) -> str:
 def load_chunks(path: Path) -> list[dict[str, object]]:
     table = pq.read_table(path)
     chunks = table.to_pylist()
+    rarity_by_stack = load_stack_rarity_scores()
     for chunk in tqdm(chunks, desc="Load chunk difficulty", unit="chunk"):
         stack_text = chunk.get("stacks") or ""
         chunk["_stack_set"] = frozenset(str(stack_text).split())
+        chunk["_rare_stack_set"] = frozenset(
+            stack
+            for stack in chunk["_stack_set"]
+            if has_tibetan_letter(stack)
+            and rarity_by_stack.get(stack, 1.0) >= RARE_STACK_THRESHOLD
+        )
+        chunk["_rare_stack_weight"] = {
+            stack: rarity_by_stack.get(stack, 1.0)
+            for stack in chunk["_rare_stack_set"]
+        }
         if chunk.get("stack_difficulty_score") is None:
             chunk["stack_difficulty_score"] = stack_difficulty_score(str(chunk.get("text") or ""))
         else:
@@ -129,6 +144,8 @@ def font_supports_chunk(font: FontCatalogRow, chunk: dict[str, object], supporte
 
 
 def chunk_difficulty_tier(chunk: dict[str, object]) -> str:
+    if "_rare_stack_set" in chunk:
+        return "difficult" if chunk["_rare_stack_set"] else "normal"
     return "difficult" if float(chunk["stack_difficulty_score"]) > 0 else "normal"
 
 
@@ -294,37 +311,114 @@ def next_chunk_for_font(
     chunk_use_counts: Counter[str],
     reused_chunk_ids: set[str],
     max_reused_chunks: int,
-    cursors: dict[tuple[str, str, str, bool], int],
+    cursors: dict[tuple[str, str, str, str, bool], int],
+    pending_candidates: dict[
+        tuple[str, str, str, str, bool], list[dict[str, object]]
+    ],
+    covered_rare_stacks: dict[tuple[str, str], set[str]],
     *,
     tier: str,
     allow_reuse: bool,
 ) -> dict[str, object] | None:
     font = font_info.font
-    cursor_key = (font.basename, font_info.split, tier, allow_reuse)
+    face_index = str(font.ttc_face_index or "")
+    cursor_key = (font.basename, face_index, font_info.split, tier, allow_reuse)
+    coverage_key = (font.basename, face_index)
+
+    def candidate_is_available(chunk: dict[str, object]) -> bool:
+        chunk_id = str(chunk["chunk_id"])
+        if (font.basename, chunk_id) in used_font_chunks:
+            return False
+        if not font_supports_chunk(font, chunk, supported):
+            return False
+        owner_split = chunk_split.get(chunk_id)
+        if owner_split is not None and owner_split != font_info.split:
+            return False
+        if allow_reuse:
+            if owner_split != font_info.split:
+                return False
+            if (
+                chunk_use_counts[chunk_id] == 1
+                and len(reused_chunk_ids) >= max_reused_chunks
+            ):
+                return False
+        elif owner_split is not None:
+            return False
+        return True
+
+    def selected_copy(chunk: dict[str, object]) -> dict[str, object]:
+        rare_stacks = set(chunk.get("_rare_stack_set") or ())
+        covered = covered_rare_stacks[coverage_key]
+        new_stacks = rare_stacks - covered
+        rarity_weights = dict(chunk.get("_rare_stack_weight") or {})
+        rarity_gain = sum(float(rarity_weights.get(stack, 1.0)) for stack in new_stacks)
+        repetition = float(chunk.get("text_repetition_score") or 0.0)
+        repetition_utility = (
+            repetition if "_rewarded_repetition" in tier else 1.0 - repetition
+        )
+        coverage_score = (
+            0.45 * min(len(new_stacks), 4) / 4
+            + 0.25 * min(rarity_gain, 4.0) / 4.0
+            + 0.20 * repetition_utility
+            + 0.10 * float(chunk.get("stack_difficulty_score") or 0.0)
+        )
+        covered.update(rare_stacks)
+        selected = dict(chunk)
+        selected["_coverage_new_rare_stack_count"] = len(new_stacks)
+        selected["_coverage_rare_stack_count"] = len(rare_stacks)
+        selected["_coverage_rarity_gain"] = round(rarity_gain, 6)
+        selected["_coverage_selection_score"] = round(coverage_score, 6)
+        return selected
+
     idx = cursors.get(cursor_key, 0)
+
+    if tier.startswith("difficult_"):
+        candidates = [
+            chunk
+            for chunk in pending_candidates.get(cursor_key, [])
+            if candidate_is_available(chunk)
+        ]
+        while idx < len(chunks) and len(candidates) < COVERAGE_LOOKAHEAD:
+            chunk = chunks[idx]
+            idx += 1
+            if candidate_is_available(chunk):
+                candidates.append(chunk)
+        cursors[cursor_key] = idx
+        if not candidates:
+            pending_candidates[cursor_key] = []
+            return None
+
+        covered = covered_rare_stacks[coverage_key]
+
+        def coverage_rank(chunk: dict[str, object]) -> tuple[float, int, float, str]:
+            rare_stacks = set(chunk.get("_rare_stack_set") or ())
+            new_stacks = rare_stacks - covered
+            weights = dict(chunk.get("_rare_stack_weight") or {})
+            rarity_gain = sum(float(weights.get(stack, 1.0)) for stack in new_stacks)
+            repetition = float(chunk.get("text_repetition_score") or 0.0)
+            repetition_utility = (
+                repetition if "_rewarded_repetition" in tier else 1.0 - repetition
+            )
+            score = (
+                0.45 * min(len(new_stacks), 4) / 4
+                + 0.25 * min(rarity_gain, 4.0) / 4.0
+                + 0.20 * repetition_utility
+                + 0.10 * float(chunk.get("stack_difficulty_score") or 0.0)
+            )
+            return score, len(new_stacks), rarity_gain, str(chunk["chunk_id"])
+
+        selected = max(candidates, key=coverage_rank)
+        candidates.remove(selected)
+        pending_candidates[cursor_key] = candidates
+        return selected_copy(selected)
+
     while idx < len(chunks):
         chunk = chunks[idx]
         idx += 1
-        chunk_id = str(chunk["chunk_id"])
-        font_chunk_key = (font.basename, chunk_id)
-        if font_chunk_key in used_font_chunks:
+        if not candidate_is_available(chunk):
             continue
-        if not font_supports_chunk(font, chunk, supported):
-            continue
-
-        owner_split = chunk_split.get(chunk_id)
-        if owner_split is not None and owner_split != font_info.split:
-            continue
-        if allow_reuse:
-            if owner_split != font_info.split:
-                continue
-            if chunk_use_counts[chunk_id] == 1 and len(reused_chunk_ids) >= max_reused_chunks:
-                continue
-        elif owner_split is not None:
-            continue
-
         cursors[cursor_key] = idx
-        return chunk
+        return selected_copy(chunk)
     cursors[cursor_key] = idx
     return None
 
@@ -380,6 +474,19 @@ def _plan_row_dict(
             "high_repetition_preferred"
             if requested_text_repetition_policy == "rewarded"
             else "low_repetition_preferred"
+        ),
+        "source_text_coverage_policy": "bounded_greedy_rare_stack_coverage",
+        "source_text_new_rare_stack_count": int(
+            chunk.get("_coverage_new_rare_stack_count") or 0
+        ),
+        "source_text_rare_stack_count": int(
+            chunk.get("_coverage_rare_stack_count") or 0
+        ),
+        "source_text_rarity_coverage_gain": float(
+            chunk.get("_coverage_rarity_gain") or 0.0
+        ),
+        "source_text_coverage_selection_score": float(
+            chunk.get("_coverage_selection_score") or 0.0
         ),
         "basename": font.basename,
         "font_name": font_name(font),
@@ -458,7 +565,11 @@ def make_per_font_plan_rows(
     chunk_split: dict[str, str] = {}
     chunk_use_counts: Counter[str] = Counter()
     reused_chunk_ids: set[str] = set()
-    cursors: dict[tuple[str, str, str, bool], int] = {}
+    cursors: dict[tuple[str, str, str, str, bool], int] = {}
+    pending_candidates: dict[
+        tuple[str, str, str, str, bool], list[dict[str, object]]
+    ] = defaultdict(list)
+    covered_rare_stacks: dict[tuple[str, str], set[str]] = defaultdict(set)
     target_images = len(eligible_fonts) * images_per_font
     max_reused_chunks = int(target_images * max(0.0, max_chunk_reuse_ratio))
     image_id = 1
@@ -497,6 +608,8 @@ def make_per_font_plan_rows(
                         reused_chunk_ids,
                         max_reused_chunks,
                         cursors,
+                        pending_candidates,
+                        covered_rare_stacks,
                         tier=pool_key,
                         allow_reuse=allow_reuse,
                     )
@@ -610,7 +723,11 @@ def make_plan_rows(
     chunk_split: dict[str, str] = {}
     chunk_use_counts: Counter[str] = Counter()
     reused_chunk_ids: set[str] = set()
-    cursors: dict[tuple[str, str, str, bool], int] = {}
+    cursors: dict[tuple[str, str, str, str, bool], int] = {}
+    pending_candidates: dict[
+        tuple[str, str, str, str, bool], list[dict[str, object]]
+    ] = defaultdict(list)
+    covered_rare_stacks: dict[tuple[str, str], set[str]] = defaultdict(set)
     difficulty_counts_by_font: dict[str, Counter[str]] = defaultdict(Counter)
     max_reused_chunks = int(target_images * max(0.0, max_chunk_reuse_ratio))
     image_id = 1
@@ -666,6 +783,8 @@ def make_plan_rows(
                                     reused_chunk_ids,
                                     max_reused_chunks,
                                     cursors,
+                                    pending_candidates,
+                                    covered_rare_stacks,
                                     tier=pool_key,
                                     allow_reuse=allow_reuse,
                                 )

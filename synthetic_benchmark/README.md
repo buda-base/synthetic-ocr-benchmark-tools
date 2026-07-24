@@ -107,7 +107,11 @@ Repetition is balanced independently from rarity. For each font, nine out of
 every ten source-text slots prefer the least repetitive compatible chunks; the
 tenth deliberately prefers highly repetitive text so that 10% remains covered.
 The score compares dominant syllables, adjacent repeats, and repeated bigrams
-and trigrams. The score and requested policy are stored in the render plan.
+and trigrams. Within difficult slots, a bounded greedy selector balances 70%
+new rare-stack coverage, 20% of the requested repetition objective, and 10%
+overall chunk difficulty. This expands distinct rare-stack coverage per font
+without returning to highly repetitive source text. Coverage gains, repetition
+score, and requested policy are stored in the render plan.
 
 ## 2b. Review font-level augmentation
 
@@ -288,8 +292,10 @@ Paper color and page noise are not applied to real-background pages. LowLightNoi
 LinesDegradation are excluded: the latter targets long straight rules and table
 borders, so it had no meaningful target on the pecha pages.
 
-InkShifter (8%), folding (3%), and blur (10%) are assigned independently per
-font. Blur has only mild and medium levels. Geometric augmentation assigns
+InkShifter (8%) and folding (3%) are assigned independently per font. Every
+output receives mandatory raster naturalization profile A: slight subpixel
+distortion, Gaussian blur, fine luminance noise, and sparse white ink dropout.
+The closest 15% per font receives the stronger profile B. Geometric augmentation assigns
 rotation to 70% of each font's pages: 60% use the typical central range up to
 about 0.9 degrees, and 10% use the broader empirical tail from 0.9 to 2.4
 degrees. TPS baseline curvature is applied to 30% of pages, all selected from
@@ -352,7 +358,8 @@ pdftoppm -jpeg -jpegopt quality=95 -gray -scale-to-x 3500 -scale-to-y -1
 Without document augmentation, final JPEGs are explicitly converted to grayscale
 (`L`). Each page is resized to its assigned 1800–3500 px width before final
 encoding. With augmentation, the intermediate starts on white and ink is composited
-onto the selected real, synthetic, or clean paper before TPS, rotation, and blur.
+onto the selected real, synthetic, or clean paper before TPS, rotation, and
+mandatory raster naturalization.
 Real backgrounds are stretched to the exact output dimensions rather than
 cropped when their aspect ratio differs.
 

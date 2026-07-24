@@ -165,7 +165,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paper-background-download-workers", type=int, default=16)
     parser.add_argument("--inkshifter-rate", type=float, default=0.08)
     parser.add_argument("--folding-rate", type=float, default=0.03)
-    parser.add_argument("--blur-rate", type=float, default=0.10)
+    parser.add_argument(
+        "--blur-rate",
+        type=float,
+        default=1.0,
+        help="Deprecated compatibility option; raster naturalization is mandatory.",
+    )
+    parser.add_argument(
+        "--naturalization-b-rate",
+        type=float,
+        default=0.15,
+        help="Share receiving stronger profile B raster naturalization.",
+    )
     parser.add_argument("--rotation-rate", type=float, default=0.70)
     parser.add_argument("--rotation-high-rate", type=float, default=0.10)
     parser.add_argument("--tps-rate", type=float, default=0.30)
@@ -646,6 +657,19 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
         float(first.get("source_text_repetition_score") or 0.0),
         float(second.get("source_text_repetition_score") or 0.0),
     )
+    first["source_text_new_rare_stack_count"] = int(
+        first.get("source_text_new_rare_stack_count") or 0
+    ) + int(second.get("source_text_new_rare_stack_count") or 0)
+    first["source_text_rare_stack_count"] = int(
+        first.get("source_text_rare_stack_count") or 0
+    ) + int(second.get("source_text_rare_stack_count") or 0)
+    first["source_text_rarity_coverage_gain"] = float(
+        first.get("source_text_rarity_coverage_gain") or 0.0
+    ) + float(second.get("source_text_rarity_coverage_gain") or 0.0)
+    first["source_text_coverage_selection_score"] = max(
+        float(first.get("source_text_coverage_selection_score") or 0.0),
+        float(second.get("source_text_coverage_selection_score") or 0.0),
+    )
     repetition_policies = {
         str(first.get("source_text_repetition_policy") or ""),
         str(second.get("source_text_repetition_policy") or ""),
@@ -791,19 +815,6 @@ def apply_shorthands_to_rows(
     return prepared
 
 
-def save_grayscale_jpeg(src: Path, dest: Path, quality: int, width_px: int) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with Image.open(src) as img:
-        grayscale = img.convert("L")
-        if grayscale.width != width_px:
-            height_px = max(1, round(grayscale.height * width_px / grayscale.width))
-            grayscale = grayscale.resize(
-                (width_px, height_px),
-                Image.Resampling.LANCZOS,
-            )
-        grayscale.save(dest, "JPEG", quality=quality)
-
-
 def strip_transcription_line_edges(text: str) -> str:
     """Strip leading/trailing spaces from each rendered transcription line."""
     return "\n".join(line.strip() for line in text.splitlines()).strip()
@@ -917,6 +928,21 @@ def write_text_and_catalog(
                 "source_text_repetition_basis": (
                     row.get("source_text_repetition_basis") or ""
                 ),
+                "source_text_coverage_policy": (
+                    row.get("source_text_coverage_policy") or ""
+                ),
+                "source_text_new_rare_stack_count": int(
+                    row.get("source_text_new_rare_stack_count") or 0
+                ),
+                "source_text_rare_stack_count": int(
+                    row.get("source_text_rare_stack_count") or 0
+                ),
+                "source_text_rarity_coverage_gain": float(
+                    row.get("source_text_rarity_coverage_gain") or 0.0
+                ),
+                "source_text_coverage_selection_score": float(
+                    row.get("source_text_coverage_selection_score") or 0.0
+                ),
                 "suggested_split": row.get("suggested_split") or "",
                 "bocorpus_row": "|".join(row["_source_bocorpus_rows"]),
                 "char_start": row["char_start"],
@@ -983,6 +1009,24 @@ def write_text_and_catalog(
                     row.get("document_augmentation_spatial_strength") or ""
                 ),
                 "document_augmentation_blur": row.get("document_augmentation_blur") or "",
+                "raster_naturalization_profile": (
+                    row.get("raster_naturalization_profile") or ""
+                ),
+                "raster_naturalization_seed": (
+                    row.get("raster_naturalization_seed") or ""
+                ),
+                "raster_naturalization_blur_sigma": (
+                    row.get("raster_naturalization_blur_sigma") or ""
+                ),
+                "raster_naturalization_white_dropout_rate": (
+                    row.get("raster_naturalization_white_dropout_rate") or ""
+                ),
+                "raster_naturalization_luminance_noise_sigma": (
+                    row.get("raster_naturalization_luminance_noise_sigma") or ""
+                ),
+                "raster_naturalization_displacement_px": (
+                    row.get("raster_naturalization_displacement_px") or ""
+                ),
                 "document_augmentation_rotation_strength": (
                     row.get("document_augmentation_rotation_strength") or ""
                 ),
@@ -1212,11 +1256,13 @@ def render_batch(
                 jpeg_quality=int(row.get("output_jpeg_quality") or args.jpeg_quality),
             )
         else:
-            save_grayscale_jpeg(
+            from document_augmentation import apply_raster_naturalization
+
+            apply_raster_naturalization(
                 src,
                 dest,
-                int(row.get("output_jpeg_quality") or args.jpeg_quality),
-                int(row.get("output_width_px") or args.raster_width_px),
+                row,
+                jpeg_quality=int(row.get("output_jpeg_quality") or args.jpeg_quality),
             )
         for alternative_extension in (".jpg", ".tif"):
             alternative = dest.with_suffix(alternative_extension)
@@ -1531,6 +1577,21 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "source_text_repetition_basis": (
                     row.get("source_text_repetition_basis") or ""
                 ),
+                "source_text_coverage_policy": (
+                    row.get("source_text_coverage_policy") or ""
+                ),
+                "source_text_new_rare_stack_count": int(
+                    row.get("source_text_new_rare_stack_count") or 0
+                ),
+                "source_text_rare_stack_count": int(
+                    row.get("source_text_rare_stack_count") or 0
+                ),
+                "source_text_rarity_coverage_gain": float(
+                    row.get("source_text_rarity_coverage_gain") or 0.0
+                ),
+                "source_text_coverage_selection_score": float(
+                    row.get("source_text_coverage_selection_score") or 0.0
+                ),
                 "suggested_split": row.get("suggested_split") or "",
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
                 "font_augmentation_specs": row.get("font_augmentation_specs") or "",
@@ -1585,6 +1646,24 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     row.get("document_augmentation_spatial_strength") or ""
                 ),
                 "document_augmentation_blur": row.get("document_augmentation_blur") or "",
+                "raster_naturalization_profile": (
+                    row.get("raster_naturalization_profile") or ""
+                ),
+                "raster_naturalization_seed": (
+                    row.get("raster_naturalization_seed") or ""
+                ),
+                "raster_naturalization_blur_sigma": (
+                    row.get("raster_naturalization_blur_sigma") or ""
+                ),
+                "raster_naturalization_white_dropout_rate": (
+                    row.get("raster_naturalization_white_dropout_rate") or ""
+                ),
+                "raster_naturalization_luminance_noise_sigma": (
+                    row.get("raster_naturalization_luminance_noise_sigma") or ""
+                ),
+                "raster_naturalization_displacement_px": (
+                    row.get("raster_naturalization_displacement_px") or ""
+                ),
                 "document_augmentation_rotation_strength": (
                     row.get("document_augmentation_rotation_strength") or ""
                 ),
@@ -1977,6 +2056,31 @@ def main() -> None:
         "10% of pages use a sparse font-size multiplier"
     )
     print(f"Wrote {page_layout_manifest_path}")
+    from document_augmentation import assign_raster_naturalization
+
+    rows, raster_naturalization_manifest = assign_raster_naturalization(
+        rows,
+        profile_b_rate=args.naturalization_b_rate,
+        seed=args.document_augmentation_seed,
+    )
+    raster_naturalization_manifest_path = (
+        args.out_dir / "raster_naturalization_manifest.json"
+    )
+    raster_naturalization_manifest_path.write_text(
+        json.dumps(
+            raster_naturalization_manifest,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "Mandatory raster naturalization assigned to all pages; "
+        f"profile B on {args.naturalization_b_rate:.1%}"
+    )
+    print(f"Wrote {raster_naturalization_manifest_path}")
     if args.document_augmentation:
         from document_augmentation import (
             assign_document_augmentations,
@@ -2001,7 +2105,8 @@ def main() -> None:
             synthetic_paper_rate=args.synthetic_paper_rate,
             inkshifter_rate=args.inkshifter_rate,
             folding_rate=args.folding_rate,
-            blur_rate=args.blur_rate,
+            blur_rate=1.0,
+            naturalization_b_rate=args.naturalization_b_rate,
             rotation_rate=args.rotation_rate,
             rotation_high_rate=args.rotation_high_rate,
             tps_rate=args.tps_rate,
