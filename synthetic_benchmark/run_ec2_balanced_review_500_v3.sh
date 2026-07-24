@@ -14,11 +14,15 @@ exec > >(tee -a "$LOG") 2>&1
 cd "$PROJECT"
 mkdir -p "$OUT"
 
-echo "[plan] Building a balanced 250-Uchen / 250-Ume review plan"
-"$PYTHON" synthetic_benchmark/build_balanced_review_plan.py \
-  --output "$PLAN" \
-  --target-images 500 \
-  --seed 13
+if [[ -s "$PLAN" ]]; then
+  echo "[plan] Reusing existing balanced review plan: $PLAN"
+else
+  echo "[plan] Building a balanced 250-Uchen / 250-Ume review plan"
+  "$PYTHON" synthetic_benchmark/build_balanced_review_plan.py \
+    --output "$PLAN" \
+    --target-images 500 \
+    --seed 13
+fi
 
 echo "[render] Starting balanced 500-page review generation"
 "$PYTHON" synthetic_benchmark/render_batches.py \

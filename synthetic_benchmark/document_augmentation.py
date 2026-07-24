@@ -526,6 +526,21 @@ def assign_document_augmentations(
                 item["document_augmentation_output_extension"] = ".jpg"
                 paper_counts["clean"] += 1
 
+            # Letterpress represents faded ink with grayscale values (currently
+            # 165-250). A final 1-bit threshold turns most of that ink white,
+            # so use a contrast-preserving ink effect for bilevel pages.
+            if (
+                item["document_augmentation_output_mode"] == "1"
+                and item["document_augmentation_local"] == "letterpress"
+            ):
+                strength = str(item["document_augmentation_local_strength"])
+                old_key = f"letterpress:{strength}"
+                local_counts[old_key] -= 1
+                if local_counts[old_key] == 0:
+                    del local_counts[old_key]
+                item["document_augmentation_local"] = "inkbleed"
+                local_counts[f"inkbleed:{strength}"] += 1
+
             if index in ink_indices:
                 item["document_augmentation_spatial"] = "inkshifter"
                 item["document_augmentation_spatial_strength"] = (
@@ -649,6 +664,10 @@ def assign_document_augmentations(
             ),
             "exclusive_sources": ["real", "synthetic", "clean"],
             "bilevel_encoding": "TIFF Group 4",
+            "bilevel_local_effect_policy": {
+                "letterpress_replacement": "inkbleed",
+                "reason": "grayscale letterpress ink is lost at the 1-bit threshold",
+            },
             "readability_policy": {
                 "light_only_below_effective_text_scale": 36_000,
                 "no_dark_below_effective_text_scale": 50_000,

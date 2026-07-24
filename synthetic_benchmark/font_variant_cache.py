@@ -134,6 +134,101 @@ class S3FontVariantCache:
         )
         return f"s3://{self.bucket}/{key}"
 
+    def fetch_rejection(
+        self,
+        *,
+        basename: str,
+        source_hash: str,
+        face_index: int,
+        variant_id: str,
+        specs: list[dict[str, object]],
+        policy_key: str,
+        raster_qc_version: int,
+    ) -> dict[str, object] | None:
+        filename = unique_variant_name(
+            basename,
+            source_hash,
+            face_index,
+            variant_id,
+        )
+        key = self._key(
+            source_hash,
+            face_index,
+            f"{filename}.rejected--{policy_key}.json",
+        )
+        try:
+            rejection = json.loads(
+                _s3_client()
+                .get_object(Bucket=self.bucket, Key=key)["Body"]
+                .read()
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {
+                "404",
+                "NoSuchKey",
+                "NotFound",
+            }:
+                return None
+            raise
+        expected = {
+            "source_sha256": source_hash,
+            "face_index": face_index,
+            "variant_id": variant_id,
+            "specs": specs,
+            "policy_key": policy_key,
+            "raster_qc_version": raster_qc_version,
+            "decision": "reject_variant",
+        }
+        if any(rejection.get(field) != value for field, value in expected.items()):
+            raise ValueError(f"Font rejection cache mismatch: s3://{self.bucket}/{key}")
+        rejection["s3_uri"] = f"s3://{self.bucket}/{key}"
+        return rejection
+
+    def store_rejection(
+        self,
+        *,
+        basename: str,
+        source_hash: str,
+        face_index: int,
+        variant_id: str,
+        specs: list[dict[str, object]],
+        policy_key: str,
+        raster_qc_version: int,
+        reason: str,
+    ) -> str:
+        filename = unique_variant_name(
+            basename,
+            source_hash,
+            face_index,
+            variant_id,
+        )
+        key = self._key(
+            source_hash,
+            face_index,
+            f"{filename}.rejected--{policy_key}.json",
+        )
+        rejection = {
+            "cache_version": 1,
+            "source_sha256": source_hash,
+            "face_index": face_index,
+            "variant_id": variant_id,
+            "specs": specs,
+            "policy_key": policy_key,
+            "raster_qc_version": raster_qc_version,
+            "decision": "reject_variant",
+            "reason": reason,
+        }
+        _s3_client().put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=(
+                json.dumps(rejection, ensure_ascii=False, sort_keys=True, indent=2)
+                + "\n"
+            ).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return f"s3://{self.bucket}/{key}"
+
     def fetch(
         self,
         *,

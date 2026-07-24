@@ -1013,7 +1013,7 @@ def write_text_and_catalog(
                     row.get("raster_naturalization_profile") or ""
                 ),
                 "raster_naturalization_seed": (
-                    row.get("raster_naturalization_seed") or ""
+                    str(row.get("raster_naturalization_seed") or "")
                 ),
                 "raster_naturalization_blur_sigma": (
                     row.get("raster_naturalization_blur_sigma") or ""
@@ -1044,7 +1044,9 @@ def write_text_and_catalog(
                 "document_augmentation_tps_offsets_height": (
                     row.get("document_augmentation_tps_offsets_height") or ""
                 ),
-                "document_augmentation_seed": row.get("document_augmentation_seed") or "",
+                "document_augmentation_seed": str(
+                    row.get("document_augmentation_seed") or ""
+                ),
             }
         )
     return next_output_id
@@ -1650,7 +1652,7 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     row.get("raster_naturalization_profile") or ""
                 ),
                 "raster_naturalization_seed": (
-                    row.get("raster_naturalization_seed") or ""
+                    str(row.get("raster_naturalization_seed") or "")
                 ),
                 "raster_naturalization_blur_sigma": (
                     row.get("raster_naturalization_blur_sigma") or ""

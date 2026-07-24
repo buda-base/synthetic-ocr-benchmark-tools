@@ -322,6 +322,26 @@ def generate_variants_for_font(
                     )
                 )
                 continue
+            cached_rejection = remote_cache.fetch_rejection(
+                basename=str(row["basename"]),
+                source_hash=source_hash,
+                face_index=face_index,
+                variant_id=variant_id,
+                specs=spec_payload,
+                policy_key=policy_key,
+                raster_qc_version=RASTER_QC_VERSION,
+            )
+            if cached_rejection is not None:
+                rejected.append(
+                    {
+                        "variant_id": variant_id,
+                        "specs": [spec.label for spec in specs],
+                        "error": str(cached_rejection["reason"]),
+                        "cache_hit": True,
+                        "rejection_uri": str(cached_rejection["s3_uri"]),
+                    }
+                )
+                continue
         try:
             path, provenance = _apply_specs(
                 source,
@@ -367,13 +387,25 @@ def generate_variants_for_font(
                 )
             accepted.append(runtime_variant)
         except Exception as exc:
-            rejected.append(
-                {
-                    "variant_id": variant_id,
-                    "specs": [spec.label for spec in specs],
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            error = f"{type(exc).__name__}: {exc}"
+            rejection = {
+                "variant_id": variant_id,
+                "specs": [spec.label for spec in specs],
+                "error": error,
+                "cache_hit": False,
+            }
+            if remote_cache is not None and isinstance(exc, ValueError):
+                rejection["rejection_uri"] = remote_cache.store_rejection(
+                    basename=str(row["basename"]),
+                    source_hash=source_hash,
+                    face_index=face_index,
+                    variant_id=variant_id,
+                    specs=spec_payload,
+                    policy_key=policy_key,
+                    raster_qc_version=RASTER_QC_VERSION,
+                    reason=error,
+                )
+            rejected.append(rejection)
     if not accepted:
         reason = (
             f"No safe augmented variant was accepted after {max_attempts} attempts"
@@ -490,9 +522,13 @@ def prepare_font_variants(
             for variant in variants
             if any(step.get("operation") == "s3_cache" for step in variant.provenance)
         )
+        rejection_cache_hits = sum(
+            bool(rejection.get("cache_hit")) for rejection in rejected
+        )
         font_progress.set_postfix_str(
             f"{basename} ({len(variants)}/{variants_per_font}, "
-            f"{cache_hits} cached, {len(rejected)} rejected)"
+            f"{cache_hits} cached, {len(rejected)} rejected, "
+            f"{rejection_cache_hits} rejection-cache hits)"
         )
         prepared.extend(assign_variants_to_rows(font_rows, variants))
         manifest_fonts.append(
@@ -502,6 +538,7 @@ def prepare_font_variants(
                 "source_face_index": str(font_rows[0].get("ttc_face_index") or ""),
                 "requested_variants": variants_per_font,
                 "s3_cache_hits": cache_hits,
+                "s3_rejection_cache_hits": rejection_cache_hits,
                 "accepted": [
                     {
                         "variant_id": variant.variant_id,

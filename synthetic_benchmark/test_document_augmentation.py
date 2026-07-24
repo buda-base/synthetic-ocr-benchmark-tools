@@ -79,6 +79,29 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertEqual(counts, Counter({"Font0": 18, "Font1": 18, "Font2": 18}))
         self.assertTrue(all(font["local_rate"] == 0.9 for font in manifest["fonts"]))
 
+    def test_bilevel_pages_do_not_use_grayscale_letterpress(self) -> None:
+        prepared, manifest = assign_document_augmentations(
+            sample_rows(fonts=1, images_per_font=100),
+            paper_backgrounds=[sample_backgrounds()[0]],
+            local_rate=1.0,
+            background_rate=1.0,
+            synthetic_paper_rate=0.0,
+            seed=13,
+        )
+
+        self.assertTrue(
+            all(row["document_augmentation_output_mode"] == "1" for row in prepared)
+        )
+        self.assertFalse(
+            any(row["document_augmentation_local"] == "letterpress" for row in prepared)
+        )
+        self.assertEqual(
+            manifest["paper_policy"]["bilevel_local_effect_policy"][
+                "letterpress_replacement"
+            ],
+            "inkbleed",
+        )
+
     def test_policy_is_deterministic_and_excludes_removed_effects(self) -> None:
         first, _manifest = assign_document_augmentations(
             sample_rows(images_per_font=100),
