@@ -15,6 +15,7 @@ from typing import Iterator
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
+import zstandard as zstd
 
 from shorthand_aug import mode_for_script
 from synthetic_common import (
@@ -55,6 +56,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--batch-size", type=int, default=5000)
     parser.add_argument("--max-chunk-reuse-ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--max-text-repetition-score",
+        type=float,
+        default=None,
+        help="Exclude chunks with repetition score greater than or equal to this value.",
+    )
+    parser.add_argument(
+        "--min-zstd-compression-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Exclude chunks whose level-3 Zstd compressed/raw UTF-8 byte ratio is "
+            "below this value."
+        ),
+    )
+    parser.add_argument(
+        "--disable-rewarded-repetition",
+        action="store_true",
+        help="Use low-repetition selection for every slot; never reward repetition.",
+    )
+    parser.add_argument(
+        "--category-quota",
+        action="append",
+        default=[],
+        metavar="CATEGORY=COUNT",
+        help=(
+            "Set an exact script_8 category quota. When used, every populated "
+            "category must be specified and the quotas must sum to --target-images."
+        ),
+    )
+    parser.add_argument(
+        "--top-up-category-quotas",
+        action="store_true",
+        help=(
+            "After unique compatible selection is exhausted, reuse rows evenly across "
+            "font faces to fill every script_8 category quota exactly."
+        ),
+    )
     parser.add_argument(
         "--oversample-ume-dense",
         action="store_true",
@@ -103,11 +142,19 @@ def font_name(font: FontCatalogRow) -> str:
     return font.ps_name or font.basename or font.font_file
 
 
+def zstd_compression_ratio(text: str) -> float:
+    encoded = text.encode("utf-8")
+    if not encoded:
+        return 0.0
+    compressed = zstd.ZstdCompressor(level=3).compress(encoded)
+    return round(len(compressed) / len(encoded), 6)
+
+
 def load_chunks(path: Path) -> list[dict[str, object]]:
     table = pq.read_table(path)
     chunks = table.to_pylist()
     rarity_by_stack = load_stack_rarity_scores()
-    for chunk in tqdm(chunks, desc="Load chunk difficulty", unit="chunk"):
+    for chunk in tqdm(chunks, desc="Load chunk difficulty and density", unit="chunk"):
         stack_text = chunk.get("stacks") or ""
         chunk["_stack_set"] = frozenset(str(stack_text).split())
         rare_stack_weights: dict[str, float] = {}
@@ -127,15 +174,72 @@ def load_chunks(path: Path) -> list[dict[str, object]]:
             chunk["stack_difficulty_score"] = stack_difficulty_score(str(chunk.get("text") or ""))
         else:
             chunk["stack_difficulty_score"] = float(chunk["stack_difficulty_score"])
-        chunk["text_repetition_score"] = text_repetition_score(
-            str(chunk.get("text") or "")
-        )
+        text = str(chunk.get("text") or "")
+        chunk["text_repetition_score"] = text_repetition_score(text)
+        chunk["zstd_compression_ratio"] = zstd_compression_ratio(text)
     return chunks
 
 
 def category_quotas(categories: list[str], target: int) -> dict[str, int]:
     base, rem = divmod(target, len(categories))
     return {category: base + (1 if i < rem else 0) for i, category in enumerate(categories)}
+
+
+def parse_category_quotas(
+    specs: list[str],
+    *,
+    categories: list[str],
+    target_images: int,
+) -> dict[str, int] | None:
+    if not specs:
+        return None
+    quotas: dict[str, int] = {}
+    for spec in specs:
+        category, separator, raw_count = spec.rpartition("=")
+        category = category.strip()
+        if not separator or not category:
+            raise ValueError(f"Invalid --category-quota {spec!r}; expected CATEGORY=COUNT")
+        if category in quotas:
+            raise ValueError(f"Duplicate --category-quota for {category!r}")
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"Invalid quota count in {spec!r}") from exc
+        if count < 0:
+            raise ValueError(f"Category quota cannot be negative: {spec!r}")
+        quotas[category] = count
+    expected = set(categories)
+    supplied = set(quotas)
+    if supplied != expected:
+        raise ValueError(
+            "Explicit category quotas must cover every populated category; "
+            f"missing={sorted(expected - supplied)}, unknown={sorted(supplied - expected)}"
+        )
+    if sum(quotas.values()) != target_images:
+        raise ValueError(
+            f"Category quotas sum to {sum(quotas.values())}, expected {target_images}"
+        )
+    return quotas
+
+
+def filter_chunks_by_text_policy(
+    chunks: list[dict[str, object]],
+    *,
+    max_repetition_score: float | None,
+    min_zstd_compression_ratio: float | None,
+) -> list[dict[str, object]]:
+    return [
+        chunk
+        for chunk in chunks
+        if (
+            max_repetition_score is None
+            or float(chunk["text_repetition_score"]) < max_repetition_score
+        )
+        and (
+            min_zstd_compression_ratio is None
+            or float(chunk["zstd_compression_ratio"]) >= min_zstd_compression_ratio
+        )
+    ]
 
 
 def font_supports_chunk(font: FontCatalogRow, chunk: dict[str, object], supported: dict[str, set[str]]) -> bool:
@@ -474,6 +578,9 @@ def _plan_row_dict(
             if chunk.get("text_repetition_score") is not None
             else text_repetition_score(str(chunk.get("text") or ""))
         ),
+        "source_text_zstd_compression_ratio": float(
+            chunk.get("zstd_compression_ratio") or 0.0
+        ),
         "source_text_repetition_policy": requested_text_repetition_policy,
         "source_text_repetition_basis": (
             "high_repetition_preferred"
@@ -552,6 +659,7 @@ def make_per_font_plan_rows(
     max_chunk_reuse_ratio: float,
     oversample_ume_dense: bool = False,
     pair_shorthand_modes: bool = False,
+    reward_repetition: bool = True,
 ) -> list[dict[str, object]]:
     """Allocate exactly ``images_per_font`` coverage-compatible chunks per font."""
     if images_per_font <= 0:
@@ -593,7 +701,7 @@ def make_per_font_plan_rows(
             chunk = None
             requested_tier = "normal" if slot % 2 == 0 else "difficult"
             requested_repetition_policy = (
-                "rewarded" if slot % 10 == 9 else "penalized"
+                "rewarded" if reward_repetition and slot % 10 == 9 else "penalized"
             )
             candidate_tiers = (
                 ("difficult", "relative_difficult")
@@ -697,6 +805,8 @@ def make_plan_rows(
     seed: int,
     max_chunk_reuse_ratio: float,
     oversample_ume_dense: bool = False,
+    reward_repetition: bool = True,
+    category_quota_overrides: dict[str, int] | None = None,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
     eligible_fonts = [
@@ -708,7 +818,11 @@ def make_plan_rows(
 
     difficulty_pools = build_difficulty_pools(chunks)
     categories = sorted({font.script_category for font in eligible_fonts})
-    quotas = category_quotas(categories, target_images)
+    quotas = category_quota_overrides or category_quotas(categories, target_images)
+    if set(quotas) != set(categories) or sum(quotas.values()) != target_images:
+        raise ValueError(
+            "Category quota overrides must cover every category and sum to target_images"
+        )
 
     fonts_by_category_script_split: dict[tuple[str, str, str], list[FontPlanInfo]] = defaultdict(list)
     split_font_counts = Counter()
@@ -766,7 +880,9 @@ def make_plan_rows(
                         )
                         font_slot = font_counts["normal"] + font_counts["difficult"]
                         requested_repetition_policy = (
-                            "rewarded" if font_slot % 10 == 9 else "penalized"
+                            "rewarded"
+                            if reward_repetition and font_slot % 10 == 9
+                            else "penalized"
                         )
                         chunk = None
                         for tier in (
@@ -863,6 +979,101 @@ def make_plan_rows(
             used_font_chunks=used_font_chunks,
         )
     return rows
+
+
+def top_up_category_quotas(
+    rows: list[dict[str, object]],
+    *,
+    target_images: int,
+    category_quota_overrides: dict[str, int] | None = None,
+) -> list[dict[str, object]]:
+    """Fill category shortfalls by auditable, split-aware round-robin reuse."""
+    categories = sorted({str(row["script_8"]) for row in rows})
+    quotas = category_quota_overrides or category_quotas(categories, target_images)
+    if set(quotas) != set(categories) or sum(quotas.values()) != target_images:
+        raise ValueError(
+            "Category quota overrides must cover every category and sum to target_images"
+        )
+    prepared = [dict(row) for row in rows]
+    for row in prepared:
+        row["source_text_category_topup"] = 0
+        row["source_text_original_image_id"] = int(row["image_id"])
+
+    additions: list[dict[str, object]] = []
+    for category in categories:
+        category_rows = [row for row in prepared if row["script_8"] == category]
+        deficit = quotas[category] - len(category_rows)
+        if deficit <= 0:
+            continue
+
+        desired_splits = split_target_counts(quotas[category])
+        existing_splits = Counter(str(row["suggested_split"]) for row in category_rows)
+        available_splits = {
+            str(row["suggested_split"]) for row in category_rows
+        }
+        missing_weights = {
+            split: (
+                max(0, desired_splits[split] - existing_splits[split])
+                if split in available_splits
+                else 0
+            )
+            for split in SPLITS
+        }
+        if not any(missing_weights.values()):
+            missing_weights = {
+                split: existing_splits[split] if split in available_splits else 0
+                for split in SPLITS
+            }
+        split_additions = apportion_counts(deficit, list(SPLITS), missing_weights)
+
+        for split, split_deficit in split_additions.items():
+            if split_deficit <= 0:
+                continue
+            candidates = [
+                row for row in category_rows if row["suggested_split"] == split
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"Cannot top up {category}/{split}: no compatible source row"
+                )
+            by_face: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+            for row in candidates:
+                by_face[
+                    (
+                        str(row["font_abs_path"]),
+                        str(row.get("ttc_face_index") or ""),
+                    )
+                ].append(row)
+            for face_rows in by_face.values():
+                face_rows.sort(key=lambda row: int(row["image_id"]))
+
+            faces = sorted(by_face)
+            cursors: Counter[tuple[str, str]] = Counter()
+            for index in range(split_deficit):
+                face = faces[index % len(faces)]
+                face_rows = by_face[face]
+                source = face_rows[cursors[face] % len(face_rows)]
+                cursors[face] += 1
+                copied = dict(source)
+                copied["source_text_category_topup"] = 1
+                copied["source_text_original_image_id"] = int(source["image_id"])
+                additions.append(copied)
+
+    prepared.extend(additions)
+    prepared.sort(
+        key=lambda row: (
+            str(row["script"]),
+            str(row["script_8"]),
+            str(row["suggested_split"]),
+            -float(row["stack_difficulty_score"]),
+            str(row["font_name"]),
+            int(row["source_text_category_topup"]),
+            int(row["source_text_original_image_id"]),
+        )
+    )
+    for image_id, row in enumerate(prepared, start=1):
+        row["image_id"] = image_id
+    return prepared
 
 
 def oversample_ume_dense_rows(
@@ -1003,9 +1214,36 @@ def main() -> None:
 
     fonts = load_font_catalog(args.benchmark_csv, args.scripts_csv, args.fonts_csv)
     supported = load_supported_stacks(args.support_parquet)
-    chunks = load_chunks(args.chunks)
-    if not chunks:
+    all_chunks = load_chunks(args.chunks)
+    if not all_chunks:
         raise SystemExit(f"No chunks found in {args.chunks}")
+    chunks = filter_chunks_by_text_policy(
+        all_chunks,
+        max_repetition_score=args.max_text_repetition_score,
+        min_zstd_compression_ratio=args.min_zstd_compression_ratio,
+    )
+    if not chunks:
+        raise SystemExit("Text policy excluded every source chunk")
+    print(
+        "Text policy retained "
+        f"{len(chunks):,}/{len(all_chunks):,} chunks "
+        f"(repetition < {args.max_text_repetition_score}, "
+        f"Zstd ratio >= {args.min_zstd_compression_ratio})"
+    )
+    eligible_categories = sorted(
+        {
+            font.script_category
+            for font in fonts
+            if font.basename in supported
+            and font.script_category
+            and normalized_script(font.script_type)
+        }
+    )
+    explicit_quotas = parse_category_quotas(
+        args.category_quota,
+        categories=eligible_categories,
+        target_images=args.target_images,
+    )
 
     if args.images_per_font is not None:
         rows = make_per_font_plan_rows(
@@ -1017,6 +1255,7 @@ def main() -> None:
             max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
             oversample_ume_dense=args.oversample_ume_dense,
             pair_shorthand_modes=args.pair_shorthand_modes,
+            reward_repetition=not args.disable_rewarded_repetition,
         )
     else:
         if args.pair_shorthand_modes:
@@ -1029,7 +1268,15 @@ def main() -> None:
             seed=args.seed,
             max_chunk_reuse_ratio=args.max_chunk_reuse_ratio,
             oversample_ume_dense=args.oversample_ume_dense,
+            reward_repetition=not args.disable_rewarded_repetition,
+            category_quota_overrides=explicit_quotas,
         )
+        if args.top_up_category_quotas:
+            rows = top_up_category_quotas(
+                rows,
+                target_images=args.target_images,
+                category_quota_overrides=explicit_quotas,
+            )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, args.output, compression="zstd")
@@ -1037,10 +1284,11 @@ def main() -> None:
     write_summary(rows, summary)
     report_paths = write_selection_coverage_report(
         rows=rows,
-        chunks=chunks,
+        chunks=all_chunks,
         fonts=fonts,
         supported=supported,
         output_plan=args.output,
+        selection_candidate_chunks=chunks,
     )
     print(f"Wrote {args.output} ({len(rows)} image plan row(s))")
     print(f"Wrote {summary}")

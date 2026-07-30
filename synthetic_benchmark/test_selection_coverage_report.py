@@ -60,7 +60,7 @@ class SelectionCoverageReportTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temporary:
             plan = Path(temporary) / "plan.parquet"
-            coverage_path, buckets_path, summary_path = (
+            coverage_path, buckets_path, excluded_path, summary_path = (
                 write_selection_coverage_report(
                     rows=rows,
                     chunks=chunks,
@@ -90,7 +90,17 @@ class SelectionCoverageReportTests(unittest.TestCase):
 
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             self.assertEqual(summary["selectable_corpus_distinct_letter_stacks"], 3)
+            self.assertEqual(summary["excluded_corpus_distinct_letter_stacks"], 1)
+            self.assertEqual(
+                summary["excluded_unrenderable_distinct_letter_stacks"], 1
+            )
             self.assertEqual(summary["font_faces"], 1)
+            with excluded_path.open(encoding="utf-8", newline="") as source:
+                excluded = list(csv.DictReader(source))
+            self.assertEqual(
+                [(row["stack"], row["exclusion_reason"]) for row in excluded],
+                [("ག", "unsupported_by_all_eligible_fonts")],
+            )
 
 
 if __name__ == "__main__":

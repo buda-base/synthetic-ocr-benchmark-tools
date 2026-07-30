@@ -8,9 +8,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from synthetic_common import (
+    DEFAULT_STACKS_CSV,
     FontCatalogRow,
     has_tibetan_letter,
     load_stack_rarity_scores,
+    parse_int,
+    rarity_equivalent_stack,
     tokenize_tibetan_stacks,
 )
 
@@ -54,6 +57,25 @@ def _percentile(values: list[int], fraction: float) -> float:
     return float(ordered[position])
 
 
+def _stack_occurrence_counts(
+    path: Path,
+) -> tuple[dict[str, int], dict[str, int]]:
+    raw_counts: dict[str, int] = {}
+    equivalent_counts: Counter[str] = Counter()
+    with path.open(encoding="utf-8", newline="") as source:
+        for row in csv.DictReader(source):
+            stack = (row.get("stack") or "").strip()
+            if not stack or not has_tibetan_letter(stack):
+                continue
+            count = parse_int(
+                row.get("nb_occurences") or row.get("nb_occurrences"),
+                0,
+            )
+            raw_counts[stack] = count
+            equivalent_counts[rarity_equivalent_stack(stack)] += count
+    return raw_counts, dict(equivalent_counts)
+
+
 def write_selection_coverage_report(
     *,
     rows: list[dict[str, object]],
@@ -61,7 +83,9 @@ def write_selection_coverage_report(
     fonts: list[FontCatalogRow],
     supported: dict[str, set[str]],
     output_plan: Path,
-) -> tuple[Path, Path, Path]:
+    stacks_csv: Path = DEFAULT_STACKS_CSV,
+    selection_candidate_chunks: list[dict[str, object]] | None = None,
+) -> tuple[Path, Path, Path, Path]:
     """Write per-font totals, rarity buckets, and report definitions."""
     rarity_by_stack = load_stack_rarity_scores()
     corpus_stacks: set[str] = set()
@@ -70,6 +94,12 @@ def write_selection_coverage_report(
         if stacks is None:
             stacks = _letter_stacks(str(chunk.get("text") or ""))
         corpus_stacks.update(stack for stack in stacks if has_tibetan_letter(stack))
+    candidate_stacks: set[str] = set()
+    for chunk in selection_candidate_chunks or chunks:
+        stacks = chunk.get("_stack_set")
+        if stacks is None:
+            stacks = _letter_stacks(str(chunk.get("text") or ""))
+        candidate_stacks.update(stack for stack in stacks if has_tibetan_letter(stack))
 
     selected_by_font: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     for row in rows:
@@ -158,6 +188,7 @@ def write_selection_coverage_report(
 
     coverage_path = output_plan.with_suffix(".stack_coverage_by_font.csv")
     buckets_path = output_plan.with_suffix(".stack_rarity_by_font.csv")
+    excluded_path = output_plan.with_suffix(".excluded_corpus_stacks.csv")
     summary_path = output_plan.with_suffix(".stack_coverage_summary.json")
     for path, report_rows in (
         (coverage_path, coverage_rows),
@@ -173,9 +204,83 @@ def write_selection_coverage_report(
             writer.writeheader()
             writer.writerows(report_rows)
 
+    supported_by_any_font: set[str] = set()
+    for font in fonts:
+        supported_by_any_font.update(supported.get(font.basename, set()))
+    selected_from_corpus = globally_selected & corpus_stacks
+    excluded_stacks = corpus_stacks - selected_from_corpus
+    raw_counts, equivalent_counts = _stack_occurrence_counts(stacks_csv)
+    excluded_rows = []
+    for stack in sorted(
+        excluded_stacks,
+        key=lambda item: (
+            item not in supported_by_any_font,
+            -float(rarity_by_stack.get(item, 1.0)),
+            raw_counts.get(item, 0),
+            item,
+        ),
+    ):
+        equivalent = rarity_equivalent_stack(stack)
+        excluded_rows.append(
+            {
+                "stack": stack,
+                "rarity_equivalent_stack": equivalent,
+                "bocorpus_occurrences": raw_counts.get(stack, 0),
+                "rarity_equivalent_bocorpus_occurrences": equivalent_counts.get(
+                    equivalent, 0
+                ),
+                "rarity_score": round(float(rarity_by_stack.get(stack, 1.0)), 6),
+                "rarity_bucket": _bucket(stack, rarity_by_stack),
+                "supported_by_eligible_font_count": sum(
+                    stack in supported.get(font.basename, set()) for font in fonts
+                ),
+                "exclusion_reason": (
+                    "unsupported_by_all_eligible_fonts"
+                    if stack not in supported_by_any_font
+                    else (
+                        "excluded_by_text_policy"
+                        if stack not in candidate_stacks
+                        else "text_policy_eligible_but_not_selected"
+                    )
+                ),
+            }
+        )
+    with excluded_path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(
+            output,
+            fieldnames=list(excluded_rows[0]),
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(excluded_rows)
+
+    excluded_by_reason = Counter(
+        str(row["exclusion_reason"]) for row in excluded_rows
+    )
+    excluded_by_rarity = Counter(str(row["rarity_bucket"]) for row in excluded_rows)
     summary = {
         "selectable_corpus_distinct_letter_stacks": len(corpus_stacks),
         "selection_distinct_letter_stacks_across_all_fonts": len(globally_selected),
+        "selected_corpus_distinct_letter_stacks": len(selected_from_corpus),
+        "excluded_corpus_distinct_letter_stacks": len(excluded_stacks),
+        "excluded_renderable_distinct_letter_stacks": excluded_by_reason[
+            "excluded_by_text_policy"
+        ]
+        + excluded_by_reason[
+            "text_policy_eligible_but_not_selected"
+        ],
+        "excluded_unrenderable_distinct_letter_stacks": excluded_by_reason[
+            "unsupported_by_all_eligible_fonts"
+        ],
+        "excluded_by_text_policy_distinct_letter_stacks": excluded_by_reason[
+            "excluded_by_text_policy"
+        ],
+        "text_policy_eligible_but_not_selected_distinct_letter_stacks": (
+            excluded_by_reason["text_policy_eligible_but_not_selected"]
+        ),
+        "excluded_distinct_stacks_by_rarity_bucket": dict(
+            sorted(excluded_by_rarity.items())
+        ),
         "font_faces": len(fonts),
         "selected_pages": len(rows),
         "rarity_score": (
@@ -197,10 +302,11 @@ def write_selection_coverage_report(
         "files": {
             "per_font": coverage_path.name,
             "per_font_rarity": buckets_path.name,
+            "excluded_corpus_stacks": excluded_path.name,
         },
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    return coverage_path, buckets_path, summary_path
+    return coverage_path, buckets_path, excluded_path, summary_path

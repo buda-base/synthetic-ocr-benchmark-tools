@@ -11,3 +11,4 @@ skia-pathops
 skia-python
 tqdm
 uharfbuzz
+zstandard
