@@ -122,12 +122,12 @@ Geometry / placement failures (bounding-box heuristics on the shaped glyphs):
 |------|-----------|
 | `floating_bottom_vowel` | Bottom vowels (*āchung*, *zhabs kyu*, …) sit mid-stack instead of under it |
 | `bottom_vowel_horizontal_misalignment` | *Zhabs kyu* (or another bottom vowel) drawn mostly beside the base — catches fonts that bake a dotted-circle fallback into the vowel glyph |
-| `mid_stem` | Lowest body-attached layer (*zhabs kyu*, *ya-tag*, *ra-tag*, …) sits partway down the stem while the stem continues below it |
+| `mid_stem` | Lowest body-attached layer (*zhabs kyu*, *ya-tag*, *ra-tag*, …) sits partway down the stem while the stem continues below it. **Style-gated:** applied only to faces whose catalog descender class is Medium / Tall / Extra; skipped for Short / Legless faces (cursive *khyug* and other legless styles legitimately draw a descending tail rather than a straight stem) |
 | `tsa_phru_mark_shift` | Reshape without U+0F39 and compare; fail when *tsa-phru* shoves other marks sideways |
 | `tsa_phru_too_low` | U+0F39 center sits mid-stem instead of near the top-right of the letter |
 | `mark_horizontal_misalignment` | U+0F35 / U+0F37 drift beside the base instead of under/over it |
 | `top_mark_overlap` | Trailing top mark collides with or is swallowed by the body. Exception: on ཙ / ཚ / ཛ / ྩ / ྪ / ྫ (inherent *tsa-phru* tick), a *single* top mark that still reaches the base head may nest into the tick; mid-body marks and multi-mark pile-ups still fail |
-| `top_mark_horizontal_misalignment` | Top mark cluster mostly detached left/right |
+| `top_mark_horizontal_misalignment` | Top mark cluster mostly detached left/right. **Style-gated:** skipped for the cursive (Kyuma) and stylish (Tsugma) categories, which slant the *gigu* and other head vowels sideways by design — the catalog even records a `gigu angle for cursives` for these styles |
 | `top_diacritic_collision` | Repeated top marks share identical geometry |
 | `superscript_merge` | Separate *ra-go* mostly merged into the next letter’s head. Exception: over ྩ / ྪ / ྫ, nesting into the inherent *tsa-phru* tick is normal and is not flagged |
 | `subscript_horizontal_misalignment` | Next layer beside, not under, the previous one |
@@ -138,7 +138,9 @@ Geometry / placement failures (bounding-box heuristics on the shaped glyphs):
 
 These are intentionally conservative. We keep raw Parquet rows, render audit contact sheets, and retune — a false positive in the coverage gate is a missing page; a false negative is a poisoned label. Known bad `(font, stack)` pairs from review also land in `synthetic_benchmark/data/shorthands/denylist.csv`.
 
-Downstream, the render planner only accepts a `(font, page chunk)` if **every** stack in the chunk is supported with zero placement warnings.
+**Style-aware gating.** A few placement rules encode an *upright print* expectation that whole calligraphic styles legitimately break. Enforcing them everywhere quietly wiped out the cursive (Kyuma) faces: `དེ` (in ~95% of BoCorpus chunks) failed `top_mark_horizontal_misalignment` and `ཀྱི` / `རྗེ` failed `mid_stem` on almost every cursive font, and since a chunk is accepted only when *every* stack is supported, the Kyuma-compatible chunk pool collapsed to near zero. Rendering the flagged stacks confirmed they were false negatives — legible cursive glyphs with a descending tail or a slanted *gigu*. We now gate the two offenders by the script taxonomy: `mid_stem` runs only on faces with real descenders (Medium / Tall / Extra), and `top_mark_horizontal_misalignment` is skipped for the Kyuma and Tsugma categories. The change is purely additive (it can only turn a fail into a pass), recovers ~25.8k `(font, stack)` false negatives with **zero** regressions, and restores full support of the common blockers (`དེ`, `ཀྱི`, `གྱི`, `ཕྱི`, `རྗེ`, `རྡོ`) across all 17 cursive faces.
+
+Downstream, the render planner only accepts a `(font, page chunk)` if **every** stack in the chunk is supported with zero placement warnings. That gate removes only a thin slice of corpus stack mass; most stacks that later fail to appear in a finished benchmark plan are either rare forms the page budget never reaches, or forms that live only inside chunks rejected for low information density — not fonts that cannot draw them. [Part 2](02-rendering-pecha-pages-with-lualatex.md) breaks that gap down by reason and BoCorpus collection, weighted by stack frequency.
 
 ---
 
@@ -202,7 +204,7 @@ The overall top ten is mostly uchen — with a Shangshung *drutsa* ume face at #
 
 **Uchen highlights:** Qomolangma (Dunhuang / Subtitle / Woodblock / Title / Uchen Suring), Noto Serif Tibetan, Wujin, Rebod, Monlam Lakdi Ouchen (best Sugdri-style uchen on this run at **87.6%**). Among everyday *kyuyig* / short-uchen faces, coverage drops quickly once you leave the SKT-capable band — DDC Uchen is only **66.9%** despite clearing ordinary probes, mostly on `floating_bottom_vowel` and `subscript_containment`.
 
-**Ume highlights:** Shangshung Khra Tung / Khra Chen (Druma, ~90–93%), Qomolangma Betsu and Khampa Dedri Drugang (Tsugma, ~87–89%), plus Zhuca, Golog Dernang, and Qomolangma *drutsa* cuts in the low-to-mid 80s. The strongest ume faces match the strongest uchen faces on the BoCorpus stack list; weaker ume cuts fail for the same geometry reasons, not because “ume cannot do Sanskrit.”
+**Ume highlights:** Shangshung Khra Tung / Khra Chen (Druma, ~90–93%), Qomolangma Betsu and Khampa Dedri Drugang (Tsugma, ~89–90%), plus Zhuca, Golog Dernang, and Qomolangma *drutsa* cuts in the low-to-mid 80s. The strongest ume faces match the strongest uchen faces on the BoCorpus stack list; weaker ume cuts fail for the same geometry reasons, not because “ume cannot do Sanskrit.” The cursive (Kyuma) faces sit lower again — but after the style-aware gating above they jump 6–9 points (for example Sadri Yigchung 74.7% → 83.1%, Qomolangma Tsumachu 72.0% → 79.2%), because the rules that previously sank them were measuring cursive letterforms against upright-print expectations.
 
 The practical story for synthetic OCR: **almost every serious face looks fine on everyday Tibetan; uchen and ume diverge (and individual faces diverge) on the long SKT tail.** That is why a binary `skt_ok` flag was never enough for planning pages, and why we replaced it with a per-stack matrix joined back to the script taxonomy.
 

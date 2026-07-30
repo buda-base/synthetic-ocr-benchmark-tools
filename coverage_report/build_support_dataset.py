@@ -17,6 +17,7 @@ from coverage_common import (
     NORMAL_TIBETAN_PROBES,
     ParquetRowWriter,
     StackProbe,
+    apply_geometry_relaxation,
     load_font_rows,
     read_probe_lines,
     read_stacks_path,
@@ -87,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-fonts", type=int)
     parser.add_argument("--font", action="append", dest="fonts", help="Restrict to basename; repeatable.")
     parser.add_argument("--skt-ok", type=int, choices=(0, 1), help="Restrict by existing skt_ok flag.")
+    parser.add_argument(
+        "--no-style-relaxation",
+        action="store_true",
+        help=(
+            "Disable style-aware geometry relaxation (mid_stem gated by descender "
+            "class; top_mark_horizontal_misalignment relaxed for Kyuma/Tsugma)."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=10000)
     return parser.parse_args()
 
@@ -137,6 +146,15 @@ def main() -> None:
     )
     if not fonts:
         raise SystemExit("No font rows selected.")
+
+    if not args.no_style_relaxation:
+        fonts = apply_geometry_relaxation(fonts)
+        n_relaxed = sum(1 for f in fonts if f.relaxed_rules)
+        print(
+            f"Style-aware geometry relaxation active on {n_relaxed}/{len(fonts)} font(s) "
+            "(mid_stem gated by descender class; top_mark_horizontal_misalignment "
+            "relaxed for Kyuma/Tsugma)."
+        )
 
     output = args.output or (args.out_dir / "stack_support.parquet")
     summary_csv = args.summary_csv or output.with_suffix(".summary.csv")

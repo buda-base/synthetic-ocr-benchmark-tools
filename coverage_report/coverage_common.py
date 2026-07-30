@@ -10,8 +10,9 @@ import json
 import math
 import re
 import subprocess
+import sys
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -160,6 +161,71 @@ class FontRow:
     font_size_pt: float
     dpi: int
     skt_ok: int | None
+    # Geometry placement rules to skip for this font because they encode
+    # stylistic expectations that this style legitimately violates (e.g. cursive
+    # descending tails, slanted gigu). Empty by default.
+    relaxed_rules: frozenset[str] = frozenset()
+
+
+# --- Style-aware geometry relaxation policy ---------------------------------
+# mid_stem flags a body layer hanging below the base; cursive/legless styles
+# draw such descending tails on purpose, so it is only meaningful for fonts with
+# real descenders (Medium/Tall/Extra). top_mark_horizontal_misalignment flags a
+# top vowel drawn off the base centre; cursive (Kyuma) and stylish (Tsugma)
+# designs slant the gigu on purpose (see the catalog "gigu angle for cursives").
+MID_STEM_RELAX_DESCENDER_PREFIXES: tuple[str, ...] = ("Short", "Legless")
+TMHM_RELAX_CATEGORY_PREFIXES: tuple[str, ...] = ("Kyuma", "Tsugma")
+
+
+def relaxed_geometry_rules(descender_ratio: str, script_category: str) -> frozenset[str]:
+    """Return the set of geometry rule names to skip for a font's style."""
+    rules: set[str] = set()
+    if (descender_ratio or "").strip().startswith(MID_STEM_RELAX_DESCENDER_PREFIXES):
+        rules.add("mid_stem")
+    if (script_category or "").strip().startswith(TMHM_RELAX_CATEGORY_PREFIXES):
+        rules.add("top_mark_horizontal_misalignment")
+    return frozenset(rules)
+
+
+def load_relaxation_map_by_basename() -> dict[str, frozenset[str]]:
+    """basename -> relaxed geometry rules, from the benchmark catalog + scripts CSV.
+
+    Uses synthetic_common's catalog join (descender ratio + script category).
+    Fonts absent from the catalog get no relaxation (empty set).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    sb_dir = repo_root / "synthetic_benchmark"
+    if str(sb_dir) not in sys.path:
+        sys.path.insert(0, str(sb_dir))
+    from synthetic_common import (  # noqa: WPS433 - lazy to avoid import cycle
+        DEFAULT_BENCHMARK_CSV,
+        DEFAULT_FONTS_CSV,
+        DEFAULT_SCRIPTS_CSV,
+        load_font_catalog,
+        load_scripts,
+    )
+
+    scripts = load_scripts(DEFAULT_SCRIPTS_CSV)
+    catalog = load_font_catalog(DEFAULT_BENCHMARK_CSV, DEFAULT_SCRIPTS_CSV, DEFAULT_FONTS_CSV)
+    out: dict[str, frozenset[str]] = {}
+    for font in catalog:
+        descender = (scripts.get(font.script_id, {}).get("descenders length ratio") or "").strip()
+        out[font.basename] = relaxed_geometry_rules(descender, font.script_category)
+    return out
+
+
+def apply_geometry_relaxation(
+    fonts: Iterable[FontRow],
+    relaxation_map: dict[str, frozenset[str]] | None = None,
+) -> list[FontRow]:
+    """Return new FontRows with ``relaxed_rules`` populated from the style map."""
+    if relaxation_map is None:
+        relaxation_map = load_relaxation_map_by_basename()
+    enriched: list[FontRow] = []
+    for font in fonts:
+        rules = relaxation_map.get(font.basename, frozenset())
+        enriched.append(replace(font, relaxed_rules=rules))
+    return enriched
 
 
 @dataclass(frozen=True)
@@ -574,7 +640,9 @@ class HarfbuzzShaper:
         # behind private glyph names, so name-based detection misses them.
         if has_missing_base_letter(text):
             reasons.append("missing_base_letter")
-        placement_warnings = detect_placement_warnings(text, glyph_boxes)
+        placement_warnings = detect_placement_warnings(
+            text, glyph_boxes, self.font_row.relaxed_rules
+        )
         # Tsa-phru must not shove other marks around: reshape without U+0F39 and
         # compare relative placement of the remaining marks.
         if TSA_PHRU in text:
@@ -669,8 +737,16 @@ def trailing_top_mark_glyph_count(text: str, glyph_boxes: list[dict[str, object]
     return min(n_chars, max_strip)
 
 
-def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -> list[str]:
-    """Flag obvious geometry failures that HarfBuzz can shape but not place well."""
+def detect_placement_warnings(
+    text: str,
+    glyph_boxes: list[dict[str, object]],
+    relaxed_rules: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Flag obvious geometry failures that HarfBuzz can shape but not place well.
+
+    ``relaxed_rules`` names checks to skip for this font's style (see
+    ``relaxed_geometry_rules``); relaxed warnings are never appended.
+    """
     metrics = stack_metrics(text)
     if len(glyph_boxes) < 2:
         return []
@@ -689,7 +765,7 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
         warnings.append("top_diacritic_collision")
     if detect_top_mark_overlap(text, glyph_boxes):
         warnings.append("top_mark_overlap")
-    if detect_top_mark_horizontal_misalignment(text, glyph_boxes):
+    if "top_mark_horizontal_misalignment" not in relaxed_rules and detect_top_mark_horizontal_misalignment(text, glyph_boxes):
         warnings.append("top_mark_horizontal_misalignment")
     if detect_mark_horizontal_misalignment(text, glyph_boxes):
         warnings.append("mark_horizontal_misalignment")
@@ -746,7 +822,7 @@ def detect_placement_warnings(text: str, glyph_boxes: list[dict[str, object]]) -
         if detect_bottom_vowel_horizontal_misalignment(text, glyph_boxes):
             warnings.append("bottom_vowel_horizontal_misalignment")
 
-    if detect_mid_stem(text, glyph_boxes):
+    if "mid_stem" not in relaxed_rules and detect_mid_stem(text, glyph_boxes):
         warnings.append("mid_stem")
     if detect_tsa_phru_too_low(text, glyph_boxes):
         warnings.append("tsa_phru_too_low")
