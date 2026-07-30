@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 import random
@@ -15,8 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from font_augmentation import AugmentationSpec, variant_cache_key
 from font_augmentation_raster_qc import compare_rasters
 from font_augmentation_runtime import (
+    PREPARED_POOL_CACHE_VERSION,
     RuntimeVariant,
+    _font_group_key,
+    _prepared_pool_key,
     assign_variants_to_rows,
+    prepare_font_variants,
     sample_augmentation_specs,
 )
 from render_batches import assign_batches, fontspec_options
@@ -118,6 +124,77 @@ class RasterQCTests(unittest.TestCase):
 
 
 class RuntimeAugmentationTests(unittest.TestCase):
+    def test_prepared_pool_warm_hit_skips_font_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Source.ttf"
+            source.write_bytes(b"source")
+            local_cache = root / "persistent"
+            local_cache.mkdir()
+            variant = local_cache / "cached-variant.ttf"
+            variant.write_bytes(b"variant")
+            rows = [
+                {
+                    "image_id": image_id,
+                    "font_abs_path": str(source),
+                    "ttc_face_index": "",
+                    "basename": "Source",
+                }
+                for image_id in range(1, 101)
+            ]
+            groups = {(str(source), "", "Source"): rows}
+            pool_key, policy_key = _prepared_pool_key(
+                groups,
+                variants_per_font=1,
+                seed=13,
+                probes_path=Path(__file__).parent
+                / "data"
+                / "font_augmentation"
+                / "probes.txt",
+            )
+            group_key = _font_group_key(str(source), "", "Source")
+            pool = {
+                "cache_version": PREPARED_POOL_CACHE_VERSION,
+                "policy_key": policy_key,
+                "pool_key": pool_key,
+                "groups": {
+                    group_key: {
+                        "accepted": [
+                            {
+                                "variant_id": "variant-1",
+                                "specs": [{"operation": "width", "value": 0.9}],
+                                "raster_qc": {"automatic_pass": True},
+                                "font_filename": variant.name,
+                                "s3_uri": "s3://example/cache/cached-variant.ttf",
+                            }
+                        ],
+                        "manifest_font": {
+                            "basename": "Source",
+                            "source_face_index": "",
+                        },
+                    }
+                },
+            }
+            pool_path = local_cache / "_prepared_pools" / f"{pool_key}.json"
+            pool_path.parent.mkdir()
+            pool_path.write_text(json.dumps(pool), encoding="utf-8")
+
+            start = time.monotonic()
+            prepared, manifest = prepare_font_variants(
+                rows,
+                variants_per_font=1,
+                seed=13,
+                cache_dir=root / "temporary",
+                workers=1,
+                s3_cache_uri="s3://example/cache/",
+                local_cache_dir=local_cache,
+            )
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(len(prepared), 100)
+        self.assertTrue(manifest["prepared_pool_cache_hit"])
+        self.assertLess(elapsed, 1.0)
+
     def test_sampled_policy_stays_within_reviewed_ranges(self) -> None:
         rng = random.Random(13)
         for _ in range(500):

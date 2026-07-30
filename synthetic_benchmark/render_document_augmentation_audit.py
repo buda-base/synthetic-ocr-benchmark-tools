@@ -17,7 +17,6 @@ from augraphy import (
     DirtyDrum,
     Dithering,
     Folding,
-    Hollow,
     InkBleed,
     InkShifter,
     Letterpress,
@@ -88,20 +87,6 @@ def _factories() -> dict[str, dict[str, Callable[[], object]]]:
             ),
             "strong": lambda: InkBleed(
                 intensity_range=(0.45, 0.65), kernel_size=(5, 5), severity=(0.30, 0.45), p=1
-            ),
-        },
-        "hollow_rare": {
-            "mild": lambda: Hollow(
-                hollow_max_width_range=(60, 90), hollow_max_height_range=(60, 90),
-                hollow_max_area_range=(500, 900), hollow_dilation_kernel_size_range=(1, 1), p=1
-            ),
-            "medium": lambda: Hollow(
-                hollow_max_width_range=(100, 150), hollow_max_height_range=(100, 150),
-                hollow_max_area_range=(1200, 2500), hollow_dilation_kernel_size_range=(1, 2), p=1
-            ),
-            "strong": lambda: Hollow(
-                hollow_max_width_range=(150, 220), hollow_max_height_range=(150, 220),
-                hollow_max_area_range=(3000, 6000), hollow_dilation_kernel_size_range=(2, 3), p=1
             ),
         },
         "letterpress": {
@@ -323,7 +308,6 @@ def main() -> None:
                 "dirtydrum",
                 "dithering",
                 "inkbleed",
-                "hollow_rare",
                 "letterpress",
                 "linesdegradation",
             },

@@ -67,21 +67,32 @@ def select_round_robin(
         face_rows.sort(key=lambda row: int(row["image_id"]))
 
     selected: list[dict[str, object]] = []
-    depth = 0
+    policy_depths: dict[tuple[tuple[str, str], str], int] = defaultdict(int)
     ordered_faces = sorted(by_face)
     while len(selected) < target:
         for key in ordered_faces:
             face_rows = by_face[key]
             if not face_rows:
                 continue
+            repetition_policy = (
+                "rewarded" if len(selected) % 10 == 9 else "penalized"
+            )
+            policy_rows = [
+                row
+                for row in face_rows
+                if row.get("source_text_repetition_policy") == repetition_policy
+            ]
+            candidates = policy_rows or face_rows
+            cursor_key = (key, repetition_policy)
+            depth = policy_depths[cursor_key]
             # A few highly restricted fonts have fewer compatible source chunks
             # than their review quota. Reuse those chunks rather than dropping
             # the face; rendering still assigns independent font/document
             # augmentations to each copied row.
-            selected.append(dict(face_rows[depth % len(face_rows)]))
+            selected.append(dict(candidates[depth % len(candidates)]))
+            policy_depths[cursor_key] += 1
             if len(selected) == target:
                 break
-        depth += 1
     if len(selected) != target:
         raise ValueError(f"Only selected {len(selected)}/{target} {script} rows")
     return selected
@@ -107,8 +118,11 @@ def main() -> None:
     face_counts = Counter(normalized_script(font.script_type) for font in eligible)
     target_per_script = args.target_images // 2
     images_per_font = max(
-        math.ceil(target_per_script / face_counts[script])
-        for script in ("uchen", "ume")
+        10,
+        max(
+            math.ceil(target_per_script / face_counts[script])
+            for script in ("uchen", "ume")
+        ),
     )
     chunks = load_chunks(args.chunks)
     rows = make_per_font_plan_rows(

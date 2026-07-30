@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -79,26 +80,32 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertEqual(counts, Counter({"Font0": 18, "Font1": 18, "Font2": 18}))
         self.assertTrue(all(font["local_rate"] == 0.9 for font in manifest["fonts"]))
 
-    def test_bilevel_pages_do_not_use_grayscale_letterpress(self) -> None:
-        prepared, manifest = assign_document_augmentations(
-            sample_rows(fonts=1, images_per_font=100),
-            paper_backgrounds=[sample_backgrounds()[0]],
-            local_rate=1.0,
-            background_rate=1.0,
-            synthetic_paper_rate=0.0,
-            seed=13,
-        )
+    def test_bilevel_pages_replace_unsafe_local_effects(self) -> None:
+        with patch(
+            "document_augmentation.INK_EFFECT_WEIGHTS",
+            (("letterpress", 1.0),),
+        ):
+            prepared, manifest = assign_document_augmentations(
+                sample_rows(fonts=1, images_per_font=20),
+                paper_backgrounds=[sample_backgrounds()[0]],
+                local_rate=1.0,
+                background_rate=1.0,
+                synthetic_paper_rate=0.0,
+                seed=13,
+            )
 
         self.assertTrue(
             all(row["document_augmentation_output_mode"] == "1" for row in prepared)
         )
-        self.assertFalse(
-            any(row["document_augmentation_local"] == "letterpress" for row in prepared)
+        self.assertTrue(
+            all(row["document_augmentation_local"] == "inkbleed" for row in prepared)
         )
         self.assertEqual(
-            manifest["paper_policy"]["bilevel_local_effect_policy"][
-                "letterpress_replacement"
-            ],
+            manifest["paper_policy"]["bilevel_local_effect_policy"]["replaced_effects"],
+            ["letterpress"],
+        )
+        self.assertEqual(
+            manifest["paper_policy"]["bilevel_local_effect_policy"]["replacement"],
             "inkbleed",
         )
 

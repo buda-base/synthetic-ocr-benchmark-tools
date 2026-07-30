@@ -18,7 +18,6 @@ from augraphy import (
     DirtyDrum,
     Dithering,
     Folding,
-    Hollow,
     InkBleed,
     InkShifter,
     Letterpress,
@@ -36,7 +35,6 @@ INK_EFFECT_WEIGHTS = (
     ("bleedthrough", 11.00),
     ("dirtydrum", 7.00),
     ("dithering", 3.75),
-    ("hollow_rare", 0.25),
 )
 PAPER_EFFECT_WEIGHTS = (
     ("subtlenoise", 25.00),
@@ -52,7 +50,6 @@ STRENGTH_WEIGHTS = {
     "dirtydrum": (("mild", 0.75), ("medium", 0.25)),
     "dithering": (("mild", 0.70), ("medium", 0.30)),
     "colorpaper": (("mild", 0.70), ("medium", 0.30)),
-    "hollow_rare": (("mild", 1.0),),
 }
 DOCUMENT_AUGMENTATION_LOCK = threading.Lock()
 TPS_X_NORMALIZED = np.asarray(
@@ -236,7 +233,7 @@ def _allowed_background_tiers(
     )
     output_width = int(row.get("output_width_px") or 3500)
     effective_text_scale = rendered_font_size * output_width
-    if local_effect in {"letterpress", "hollow_rare"} or effective_text_scale < 36_000:
+    if local_effect == "letterpress" or effective_text_scale < 36_000:
         return {"light"}, effective_text_scale
     if effective_text_scale < 50_000:
         return {"light", "medium"}, effective_text_scale
@@ -526,15 +523,16 @@ def assign_document_augmentations(
                 item["document_augmentation_output_extension"] = ".jpg"
                 paper_counts["clean"] += 1
 
-            # Letterpress represents faded ink with grayscale values (currently
-            # 165-250). A final 1-bit threshold turns most of that ink white,
-            # so use a contrast-preserving ink effect for bilevel pages.
+            # Letterpress represents faded ink with grayscale values that can
+            # erase glyphs at the final 1-bit threshold, so use a
+            # contrast-preserving ink effect for bilevel pages.
             if (
                 item["document_augmentation_output_mode"] == "1"
                 and item["document_augmentation_local"] == "letterpress"
             ):
+                old_effect = str(item["document_augmentation_local"])
                 strength = str(item["document_augmentation_local_strength"])
-                old_key = f"letterpress:{strength}"
+                old_key = f"{old_effect}:{strength}"
                 local_counts[old_key] -= 1
                 if local_counts[old_key] == 0:
                     del local_counts[old_key]
@@ -665,13 +663,14 @@ def assign_document_augmentations(
             "exclusive_sources": ["real", "synthetic", "clean"],
             "bilevel_encoding": "TIFF Group 4",
             "bilevel_local_effect_policy": {
-                "letterpress_replacement": "inkbleed",
-                "reason": "grayscale letterpress ink is lost at the 1-bit threshold",
+                "replaced_effects": ["letterpress"],
+                "replacement": "inkbleed",
+                "reason": "faded ink can lose glyphs at the 1-bit threshold",
             },
             "readability_policy": {
                 "light_only_below_effective_text_scale": 36_000,
                 "no_dark_below_effective_text_scale": 50_000,
-                "light_only_effects": ["letterpress", "hollow_rare"],
+                "light_only_effects": ["letterpress"],
                 "dark_background_max_lines": 6,
                 "medium_background_max_lines": 7,
             },
@@ -779,10 +778,6 @@ def _effect(name: str, strength: str):
         ),
         ("colorpaper", "medium"): lambda: ColorPaper(
             hue_range=(28, 42), saturation_range=(10, 20), p=1
-        ),
-        ("hollow_rare", "mild"): lambda: Hollow(
-            hollow_max_width_range=(35, 60), hollow_max_height_range=(35, 60),
-            hollow_max_area_range=(200, 450), hollow_dilation_kernel_size_range=(1, 1), p=1
         ),
         ("inkshifter", "mild"): lambda: InkShifter(
             text_shift_scale_range=(4, 7), text_shift_factor_range=(1, 1),

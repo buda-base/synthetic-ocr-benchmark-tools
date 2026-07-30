@@ -27,6 +27,7 @@ echo "[render] Starting balanced 1,000-page review generation"
   --font-augmentation-variants 12 \
   --font-augmentation-workers 8 \
   --font-augmentation-s3-cache-uri s3://bec.bdrc.io/synthetic/font_cache/ \
+  --font-augmentation-local-cache-dir /mnt/synthbench/font_cache \
   --batch-size 24 \
   --jobs 8 \
   --force

@@ -213,18 +213,22 @@ SHA-256, TTC face index, and complete augmentation specification. Validated
 fonts and JSON sidecars are read from or written to
 `s3://bec.bdrc.io/synthetic/font_cache/` by default; override with
 `--font-augmentation-s3-cache-uri`, or pass an empty value to disable remote
-caching. If every bounded attempt for a font fails safety validation, a
-policy-keyed negative decision is also cached. Identical future runs immediately
-use the original font, while a changed policy version, seed, requested count, or
-probe set can evaluate it again.
+caching. Each font face also has a policy/QC-scoped aggregate index, allowing a
+future run to resolve all accepted and rejected candidates with one S3 metadata
+request instead of probing every object. If every bounded attempt for a font
+fails safety validation, a policy-keyed negative decision is also cached.
+Identical future runs immediately use the original font, while a changed policy
+version, seed, requested count, or probe set can evaluate it again.
 
 Generated fonts and QC probe renders live temporarily under
 `OUT_DIR/.font_augmentation_cache/` and are removed in a `finally` block after
-rendering. Pass `--keep-font-augmentation-cache` for debugging. The persistent
+rendering. Pass `--font-augmentation-local-cache-dir` to keep a shared local
+mirror of accepted S3 font binaries across output runs; EC2 scripts use
+`/mnt/synthbench/font_cache`. Pass `--keep-font-augmentation-cache` to retain
+temporary QC files for debugging. The persistent
 `OUT_DIR/font_augmentation_manifest.json`, catalog fragments, and alignment
 metadata retain each variant id and its exact operation labels, so page
-provenance does not depend on keeping the TTF files. Re-running with the same
-source fonts and `--font-augmentation-seed` regenerates the same pools.
+provenance does not depend on keeping the TTF files.
 
 Before a variant enters a page-rendering pool it must reopen as a valid font,
 avoid new hard shaping failures on the Tibetan probe set, render successfully,
@@ -247,8 +251,8 @@ The default inputs are one Uchen and one Ume benchmark page. Outputs under
 `out/document_augmentation_review/` include full JPEG samples, a reproducibility
 manifest, and three contact sheets per source:
 
-- local ink: bleed-through, dirty drum, dithering, ink bleed, rare hollowing,
-  letterpress, and line degradation;
+- local ink: bleed-through, dirty drum, dithering, ink bleed, letterpress, and
+  line degradation;
 - paper/photometric noise: paper color, low-light noise, noise texture, and
   subtle noise;
 - local spatial/optical effects: InkShifter, folding, and Gaussian blur.
@@ -256,9 +260,9 @@ manifest, and three contact sheets per source:
 Every row compares the source with mild, medium, and deliberately strong boundary
 values. The script downsizes only these review renders to 1400 px by default; use
 `--review-width 0` to inspect the original resolution. The strong column is not a
-proposed production distribution. In particular, hollowing, dithering, strong
-dirty-drum marks, strong low-light noise, and multi-fold samples are included to
-make rejection boundaries visible.
+proposed production distribution. In particular, dithering, strong dirty-drum
+marks, strong low-light noise, and multi-fold samples are included to make
+rejection boundaries visible.
 
 The reviewed production policy is enabled explicitly during page rendering:
 
@@ -287,7 +291,7 @@ same-mode fallback when necessary.
 
 Independently, the closest integer to 90% of each font's planned images receives
 exactly one ink appearance effect. The weighted pool includes ink bleed,
-letterpress, bleed-through, dirty drum, dithering, and rare weak Hollow.
+letterpress, bleed-through, dirty drum, and dithering.
 Paper color and page noise are not applied to real-background pages. LowLightNoise and
 LinesDegradation are excluded: the latter targets long straight rules and table
 borders, so it had no meaningful target on the pecha pages.

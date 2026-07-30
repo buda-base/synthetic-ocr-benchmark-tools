@@ -16,7 +16,6 @@ That review changed the policy:
 
 - **keep:** bleed-through, ink bleed, letterpress, dirty-drum marks, dithering, noise texture, subtle noise, InkShifter, folding, and blur;
 - **rare:** paper color, because most benchmark sources are effectively grayscale;
-- **extremely rare and weak:** hollowing, which can erase too much of thin Tibetan very quickly;
 - **remove:** low-light noise, whose strong behavior was not useful for the target documents;
 - **remove:** `LinesDegradation`, because its name is misleading for this task.
 
@@ -55,8 +54,6 @@ Mild dirty-drum marks:
 ![Center crop with mild dirty-drum marks](assets/05-image-augmentation/dirtydrum.jpg)
 
 The production pool favors mild and medium strengths. Strong dirty-drum and ink-bleed examples were useful as rejection boundaries, especially because thin ume strokes fail earlier than uchen.
-
-Hollowing remains in the policy at only about **0.2% of all pages**, with a weaker range than the review samples. It is there to represent occasional incomplete ink bodies, not to turn every letter into an outline.
 
 ---
 
@@ -147,8 +144,7 @@ Within those selected pages, the weighted pool currently favors:
 2. ink bleed and letterpress;
 3. bleed-through;
 4. mild dirty-drum marks;
-5. occasional dithering and paper color;
-6. extremely rare hollowing.
+5. occasional dithering and paper color.
 
 InkShifter and folding are assigned independently, so a page may receive one
 local appearance effect plus one spatial effect. Mandatory raster
