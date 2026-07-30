@@ -5,6 +5,14 @@ export PYTHONUNBUFFERED=1
 # Augraphy's Folding helper currently cannot JIT-compile under recent Python.
 # Its NumPy implementation is fast enough and avoids the Numba dispatcher crash.
 export NUMBA_DISABLE_JIT=1
+# Batches render in separate processes (see render_batches_parallel). Pin each
+# process to a single math thread so --jobs maps to cores instead of
+# oversubscribing them via nested BLAS/OpenMP/OpenCV thread pools.
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export OPENCV_NUM_THREADS=1
 
 PROJECT=/mnt/synthbench/repo
 PYTHON=/opt/synthbench-venv/bin/python

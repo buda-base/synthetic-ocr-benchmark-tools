@@ -15,7 +15,8 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -69,6 +70,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render planned BoCorpus/font pages.")
     parser.add_argument("render_plan", type=Path, nargs="?", default=DEFAULT_RENDER_PLAN)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--mw-id", default=MW_ID)
+    parser.add_argument("--w-id", default=W_ID)
+    parser.add_argument("--ie-id", default=IE_ID)
+    parser.add_argument("--i-id-prefix", default=I_ID_PREFIX)
+    parser.add_argument("--ve-id-prefix", default=VE_ID_PREFIX)
+    parser.add_argument("--volume-version", default=VOLUME_VERSION)
+    parser.add_argument("--benchmark-version", default=BENCHMARK_VERSION)
+    parser.add_argument("--dataset-id", default=DATASET_ID)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--page-height-mm", type=float, default=74.0)
@@ -131,6 +140,14 @@ def parse_args() -> argparse.Namespace:
         help="Immutable validated font cache; pass an empty string to disable.",
     )
     parser.add_argument(
+        "--font-augmentation-local-cache-dir",
+        type=Path,
+        help=(
+            "Persistent local mirror of accepted S3 font variants. Reuse the same "
+            "directory across output runs to avoid repeated font downloads."
+        ),
+    )
+    parser.add_argument(
         "--font-augmentation-probes",
         type=Path,
         default=DEFAULT_FONT_AUGMENTATION_PROBES,
@@ -186,6 +203,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--jobs", type=int, default=1, help="Number of batches to render in parallel")
     return parser.parse_args()
+
+
+def configure_benchmark_identifiers(args: argparse.Namespace) -> None:
+    """Set process-wide identifiers before any output paths are constructed."""
+    global MW_ID, W_ID, IE_ID, I_ID_PREFIX, VE_ID_PREFIX
+    global VOLUME_VERSION, BENCHMARK_VERSION, DATASET_ID
+
+    MW_ID = args.mw_id
+    W_ID = args.w_id
+    IE_ID = args.ie_id
+    I_ID_PREFIX = args.i_id_prefix
+    VE_ID_PREFIX = args.ve_id_prefix
+    VOLUME_VERSION = args.volume_version
+    BENCHMARK_VERSION = args.benchmark_version
+    DATASET_ID = args.dataset_id
 
 
 def volume_number(output_id: int) -> int:
@@ -683,6 +715,15 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
             if first["source_text_repetition_policy"] == "rewarded"
             else "low_repetition_preferred"
         )
+    first["source_text_category_topup"] = max(
+        int(first.get("source_text_category_topup") or 0),
+        int(second.get("source_text_category_topup") or 0),
+    )
+    original_ids = {
+        str(first.get("source_text_original_image_id") or ""),
+        str(second.get("source_text_original_image_id") or ""),
+    } - {""}
+    first["source_text_original_image_id"] = "|".join(sorted(original_ids))
     return first
 
 
@@ -927,6 +968,12 @@ def write_text_and_catalog(
                 ),
                 "source_text_repetition_basis": (
                     row.get("source_text_repetition_basis") or ""
+                ),
+                "source_text_category_topup": int(
+                    row.get("source_text_category_topup") or 0
+                ),
+                "source_text_original_image_id": str(
+                    row.get("source_text_original_image_id") or ""
                 ),
                 "source_text_coverage_policy": (
                     row.get("source_text_coverage_policy") or ""
@@ -1544,28 +1591,28 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "layout_font_scale_multiplier": float(
                     row.get("layout_font_scale_multiplier") or 1.0
                 ),
-                "layout_density_tier": row.get("layout_density_tier") or "",
-                "font_name": row.get("font_name") or "",
-                "script_8": row.get("script_8") or "",
-                "etext_source": row.get("etext_source") or "",
+                "layout_density_tier": str(row.get("layout_density_tier") or ""),
+                "font_name": str(row.get("font_name") or ""),
+                "script_8": str(row.get("script_8") or ""),
+                "etext_source": str(row.get("etext_source") or ""),
                 "stack_difficulty_score": (
                     float(row["stack_difficulty_score"])
                     if row.get("stack_difficulty_score") not in (None, "")
                     else None
                 ),
-                "source_text_difficulty_tier": (
+                "source_text_difficulty_tier": str(
                     row.get("source_text_difficulty_tier") or ""
                 ),
-                "source_text_rarity_tier": (
+                "source_text_rarity_tier": str(
                     row.get("source_text_rarity_tier") or ""
                 ),
-                "source_text_difficulty_basis": (
+                "source_text_difficulty_basis": str(
                     row.get("source_text_difficulty_basis") or ""
                 ),
-                "source_text_selection_pool": (
+                "source_text_selection_pool": str(
                     row.get("source_text_selection_pool") or ""
                 ),
-                "requested_text_difficulty_tier": (
+                "requested_text_difficulty_tier": str(
                     row.get("requested_text_difficulty_tier") or ""
                 ),
                 "source_text_repetition_score": (
@@ -1573,13 +1620,19 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     if row.get("source_text_repetition_score") not in (None, "")
                     else None
                 ),
-                "source_text_repetition_policy": (
+                "source_text_repetition_policy": str(
                     row.get("source_text_repetition_policy") or ""
                 ),
-                "source_text_repetition_basis": (
+                "source_text_repetition_basis": str(
                     row.get("source_text_repetition_basis") or ""
                 ),
-                "source_text_coverage_policy": (
+                "source_text_category_topup": int(
+                    row.get("source_text_category_topup") or 0
+                ),
+                "source_text_original_image_id": str(
+                    row.get("source_text_original_image_id") or ""
+                ),
+                "source_text_coverage_policy": str(
                     row.get("source_text_coverage_policy") or ""
                 ),
                 "source_text_new_rare_stack_count": int(
@@ -1594,22 +1647,22 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "source_text_coverage_selection_score": float(
                     row.get("source_text_coverage_selection_score") or 0.0
                 ),
-                "suggested_split": row.get("suggested_split") or "",
-                "font_augmentation_id": row.get("font_augmentation_id") or "",
-                "font_augmentation_specs": row.get("font_augmentation_specs") or "",
-                "document_augmentation_paper_source": (
+                "suggested_split": str(row.get("suggested_split") or ""),
+                "font_augmentation_id": str(row.get("font_augmentation_id") or ""),
+                "font_augmentation_specs": str(row.get("font_augmentation_specs") or ""),
+                "document_augmentation_paper_source": str(
                     row.get("document_augmentation_paper_source") or ""
                 ),
-                "document_augmentation_background_id": (
+                "document_augmentation_background_id": str(
                     row.get("document_augmentation_background_id") or ""
                 ),
-                "document_augmentation_background_uri": (
+                "document_augmentation_background_uri": str(
                     row.get("document_augmentation_background_uri") or ""
                 ),
-                "document_augmentation_background_mode": (
+                "document_augmentation_background_mode": str(
                     row.get("document_augmentation_background_mode") or ""
                 ),
-                "document_augmentation_background_luminance_tier": (
+                "document_augmentation_background_luminance_tier": str(
                     row.get("document_augmentation_background_luminance_tier") or ""
                 ),
                 "document_augmentation_background_mean_luminance": (
@@ -1627,46 +1680,52 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "document_augmentation_background_readability_fallback": int(
                     row.get("document_augmentation_background_readability_fallback") or 0
                 ),
-                "document_augmentation_paper_effect": (
+                "document_augmentation_paper_effect": str(
                     row.get("document_augmentation_paper_effect") or ""
                 ),
-                "document_augmentation_paper_strength": (
+                "document_augmentation_paper_strength": str(
                     row.get("document_augmentation_paper_strength") or ""
                 ),
-                "document_augmentation_output_mode": (
+                "document_augmentation_output_mode": str(
                     row.get("document_augmentation_output_mode") or ""
                 ),
-                "document_augmentation_output_extension": (
+                "document_augmentation_output_extension": str(
                     row.get("document_augmentation_output_extension") or ""
                 ),
-                "document_augmentation_local": row.get("document_augmentation_local") or "",
-                "document_augmentation_local_strength": (
+                "document_augmentation_local": str(
+                    row.get("document_augmentation_local") or ""
+                ),
+                "document_augmentation_local_strength": str(
                     row.get("document_augmentation_local_strength") or ""
                 ),
-                "document_augmentation_spatial": row.get("document_augmentation_spatial") or "",
-                "document_augmentation_spatial_strength": (
+                "document_augmentation_spatial": str(
+                    row.get("document_augmentation_spatial") or ""
+                ),
+                "document_augmentation_spatial_strength": str(
                     row.get("document_augmentation_spatial_strength") or ""
                 ),
-                "document_augmentation_blur": row.get("document_augmentation_blur") or "",
-                "raster_naturalization_profile": (
+                "document_augmentation_blur": str(
+                    row.get("document_augmentation_blur") or ""
+                ),
+                "raster_naturalization_profile": str(
                     row.get("raster_naturalization_profile") or ""
                 ),
-                "raster_naturalization_seed": (
-                    str(row.get("raster_naturalization_seed") or "")
+                "raster_naturalization_seed": str(
+                    row.get("raster_naturalization_seed") or ""
                 ),
-                "raster_naturalization_blur_sigma": (
+                "raster_naturalization_blur_sigma": str(
                     row.get("raster_naturalization_blur_sigma") or ""
                 ),
-                "raster_naturalization_white_dropout_rate": (
+                "raster_naturalization_white_dropout_rate": str(
                     row.get("raster_naturalization_white_dropout_rate") or ""
                 ),
-                "raster_naturalization_luminance_noise_sigma": (
+                "raster_naturalization_luminance_noise_sigma": str(
                     row.get("raster_naturalization_luminance_noise_sigma") or ""
                 ),
-                "raster_naturalization_displacement_px": (
+                "raster_naturalization_displacement_px": str(
                     row.get("raster_naturalization_displacement_px") or ""
                 ),
-                "document_augmentation_rotation_strength": (
+                "document_augmentation_rotation_strength": str(
                     row.get("document_augmentation_rotation_strength") or ""
                 ),
                 "document_augmentation_rotation_deg": (
@@ -1674,7 +1733,7 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     if row.get("document_augmentation_rotation_deg") not in (None, "")
                     else None
                 ),
-                "document_augmentation_tps_strength": (
+                "document_augmentation_tps_strength": str(
                     row.get("document_augmentation_tps_strength") or ""
                 ),
                 "document_augmentation_tps_y_norm": (
@@ -1682,7 +1741,7 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                     if row.get("document_augmentation_tps_y_norm") not in (None, "")
                     else None
                 ),
-                "document_augmentation_tps_offsets_height": (
+                "document_augmentation_tps_offsets_height": str(
                     row.get("document_augmentation_tps_offsets_height") or ""
                 ),
             }
@@ -1816,6 +1875,25 @@ def render_batch_worker(
     return batch_index, batch_id, ok, catalog_rows, worker_out
 
 
+# Set once in the parent before the process pool forks; child processes inherit
+# it via copy-on-write, so the large shorthand support map is never pickled.
+_WORKER_ARGS: argparse.Namespace | None = None
+
+
+def _init_worker_args(args: argparse.Namespace) -> None:
+    global _WORKER_ARGS
+    _WORKER_ARGS = args
+
+
+def render_batch_worker_entry(
+    payload: tuple[int, list[dict[str, object]], int],
+) -> tuple[int, str, bool, list[dict[str, object]], Path]:
+    batch_index, batch, start_output_id = payload
+    if _WORKER_ARGS is None:
+        raise RuntimeError("Worker args were not initialized before forking the pool")
+    return render_batch_worker(batch_index, batch, _WORKER_ARGS, start_output_id)
+
+
 def move_worker_output(
     result: tuple[int, str, bool, list[dict[str, object]], Path],
     final_out_dir: Path,
@@ -1854,10 +1932,18 @@ def render_batches_parallel(
     for batch in batches:
         start_ids.append(next_start)
         next_start += len(batch)
-    executor = ThreadPoolExecutor(max_workers=args.jobs)
+    # Document augmentation (augraphy) runs in-process per image and is CPU-bound
+    # pure Python, so a thread pool is serialized by the GIL. Use fork-based
+    # processes for real parallelism; args (incl. the large shorthand support map)
+    # are inherited via copy-on-write rather than pickled per task.
+    _init_worker_args(args)
+    executor = ProcessPoolExecutor(
+        max_workers=args.jobs,
+        mp_context=mp.get_context("fork"),
+    )
     progress = tqdm(total=len(batches), desc="Render batches", unit="batch")
     future_map = {
-        executor.submit(render_batch_worker, i, batch, args, start_ids[i]): i
+        executor.submit(render_batch_worker_entry, (i, batch, start_ids[i])): i
         for i, batch in enumerate(batches)
     }
     pending_results: dict[int, tuple[int, str, bool, list[dict[str, object]], Path]] = {}
@@ -1971,6 +2057,7 @@ def timed_stage(label: str):
 
 def main() -> None:
     args = parse_args()
+    configure_benchmark_identifiers(args)
     if args.image_width_px is not None:
         args.min_image_width_px = args.image_width_px
         args.max_image_width_px = args.image_width_px
@@ -2180,6 +2267,7 @@ def main() -> None:
                     hb_view_bin=args.hb_view,
                     workers=args.font_augmentation_workers,
                     s3_cache_uri=args.font_augmentation_s3_cache_uri,
+                    local_cache_dir=args.font_augmentation_local_cache_dir,
                 )
             manifest_path = args.out_dir / "font_augmentation_manifest.json"
             manifest_path.write_text(
