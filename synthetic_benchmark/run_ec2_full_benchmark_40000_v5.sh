@@ -29,8 +29,11 @@ W_ID=W1BCS005
 IE_ID=IE1BCS005
 I_ID_PREFIX=I1BCS005
 VE_ID_PREFIX=VE1BCS005
+# Benchmark/release version shared across all datasets in the release (the same
+# 202604 release that holds BECSynthetic_01..04 and the non-synthetic sets).
+# This is NOT bumped per synthetic run; only DATASET_ID advances.
 VOLUME_VERSION=v001
-BENCHMARK_VERSION=202605
+BENCHMARK_VERSION=202604
 DATASET_ID=BECSynthetic_05
 
 IMAGE_URI="s3://bec.bdrc.io/ocr_benchmark/images/$W_ID/"
