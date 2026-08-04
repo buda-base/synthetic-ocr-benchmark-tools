@@ -29,6 +29,139 @@ from PIL import Image
 from paper_backgrounds import PaperBackground, crop_resize_background
 
 
+# Local effects that fade ink into mid-gray. On 1-bit paper they disappear at
+# the bilevel threshold, leaving blank/near-blank pages. Keep the backgrounds;
+# strip these effects when output_mode is bilevel.
+BILEVEL_BANNED_LOCAL_EFFECTS = frozenset({"inkbleed", "letterpress", "bleedthrough"})
+# Dark bilevel scans (low mean luminance) bury dense middle/long text. Short
+# sparse pages may still use them. 250 keeps bright Group4 paper (~most of the
+# catalog) and drops the blotchy/dark tails (e.g. pages like 0395).
+BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE = 250.0
+DENSE_TEXT_LENGTH_BUCKETS = frozenset({"normal", "long"})
+
+
+def _clear_local_effect_counts(
+    item: dict[str, object], local_counts: Counter[str]
+) -> None:
+    effect = str(item.get("document_augmentation_local") or "")
+    strength = str(item.get("document_augmentation_local_strength") or "")
+    if not effect:
+        return
+    key = f"{effect}:{strength}"
+    local_counts[key] -= 1
+    if local_counts[key] <= 0:
+        del local_counts[key]
+    item["document_augmentation_local"] = ""
+    item["document_augmentation_local_strength"] = ""
+
+
+def _force_clean_paper(item: dict[str, object], paper_counts: Counter[str]) -> None:
+    paper_source = str(item.get("document_augmentation_paper_source") or "")
+    old_key = None
+    if paper_source == "real":
+        old_key = f"real:{item.get('document_augmentation_background_mode') or ''}"
+    elif paper_source == "synthetic":
+        old_key = (
+            "synthetic:"
+            f"{item.get('document_augmentation_paper_effect') or ''}:"
+            f"{item.get('document_augmentation_paper_strength') or ''}"
+        )
+    elif paper_source == "clean":
+        return
+    if old_key and paper_counts.get(old_key):
+        paper_counts[old_key] -= 1
+        if paper_counts[old_key] <= 0:
+            del paper_counts[old_key]
+    item["document_augmentation_paper_source"] = "clean"
+    item["document_augmentation_background_id"] = ""
+    item["document_augmentation_background_uri"] = ""
+    item["document_augmentation_background_mode"] = ""
+    item["document_augmentation_background_luminance_tier"] = ""
+    item["document_augmentation_background_mean_luminance"] = ""
+    item["document_augmentation_effective_text_scale"] = ""
+    item["document_augmentation_background_readability_fallback"] = 0
+    item["document_augmentation_paper_effect"] = ""
+    item["document_augmentation_paper_strength"] = ""
+    item["document_augmentation_output_mode"] = "L"
+    item["document_augmentation_output_extension"] = ".jpg"
+    paper_counts["clean"] += 1
+
+
+def bilevel_background_allowed_for_bucket(
+    background: PaperBackground, bucket: str
+) -> bool:
+    """Whether a real paper background may be used for this length bucket."""
+    if background.pil_mode != "1":
+        return True
+    if bucket not in DENSE_TEXT_LENGTH_BUCKETS:
+        return True
+    return float(background.mean_luminance) >= BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE
+
+
+def soften_long_page_augmentations(
+    item: dict[str, object],
+    *,
+    local_counts: Counter[str],
+    paper_counts: Counter[str],
+) -> None:
+    """Keep light geometry; drop ink-fading / strong effects on dense long pages."""
+    if str(item.get("text_length_bucket") or "") != "long":
+        return
+
+    _clear_local_effect_counts(item, local_counts)
+
+    # Keep warp/fold/rotation/TPS, but never at high strength.
+    if item.get("document_augmentation_spatial"):
+        item["document_augmentation_spatial_strength"] = "mild"
+    seed = int(item.get("document_augmentation_seed") or 0)
+    if item.get("document_augmentation_rotation_strength"):
+        if item["document_augmentation_rotation_strength"] == "high":
+            item["document_augmentation_rotation_strength"] = "typical"
+            item["document_augmentation_rotation_deg"] = round(
+                _sample_rotation_angle(
+                    random.Random(_stable_seed(seed, "long_rotation_soft")),
+                    "typical",
+                ),
+                6,
+            )
+    if item.get("document_augmentation_tps_strength"):
+        if item["document_augmentation_tps_strength"] == "high":
+            tps_y, tps_offsets = _sample_tps_parameters(
+                _stable_seed(seed, "long_tps_soft"),
+                "typical",
+            )
+            item["document_augmentation_tps_strength"] = "typical"
+            item["document_augmentation_tps_y_norm"] = round(tps_y, 6)
+            item["document_augmentation_tps_offsets_height"] = "|".join(
+                f"{offset:.8f}" for offset in tps_offsets
+            )
+
+    # Prefer clean / light real paper; dark bilevel is filtered at selection too.
+    paper_source = str(item.get("document_augmentation_paper_source") or "")
+    luminance = str(item.get("document_augmentation_background_luminance_tier") or "")
+    mean_luminance = float(item.get("document_augmentation_background_mean_luminance") or 0.0)
+    if paper_source == "synthetic" or (
+        paper_source == "real" and luminance not in {"", "light"}
+    ):
+        _force_clean_paper(item, paper_counts)
+    elif (
+        paper_source == "real"
+        and item.get("document_augmentation_output_mode") == "1"
+        and mean_luminance < BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE
+    ):
+        _force_clean_paper(item, paper_counts)
+
+    # Mild profile-A naturalization only (no B / no strong blur wipe).
+    if item.get("raster_naturalization_profile"):
+        item.update(
+            _naturalization_parameters(
+                "A",
+                int(item.get("raster_naturalization_seed") or item["document_augmentation_seed"]),
+            )
+        )
+        item["document_augmentation_blur"] = "mild"
+
+
 INK_EFFECT_WEIGHTS = (
     ("inkbleed", 17.00),
     ("letterpress", 14.00),
@@ -423,11 +556,21 @@ def assign_document_augmentations(
                     font_scale=font_scale,
                     local_effect=str(item["document_augmentation_local"]),
                 )
+                length_bucket = str(row.get("text_length_bucket") or "normal")
                 compatible = [
                     background
                     for background in paper_backgrounds
                     if background.luminance_tier in allowed_tiers
+                    and bilevel_background_allowed_for_bucket(background, length_bucket)
                 ]
+                if not compatible:
+                    # Fall back to non-bilevel paper in the allowed tiers.
+                    compatible = [
+                        background
+                        for background in paper_backgrounds
+                        if background.luminance_tier in allowed_tiers
+                        and background.pil_mode != "1"
+                    ]
                 background_seed = _stable_seed(
                     font_seed, row["image_id"], "paper_background"
                 )
@@ -436,6 +579,7 @@ def assign_document_augmentations(
                     candidate
                     for candidate in paper_backgrounds
                     if candidate.pil_mode == background.pil_mode
+                    and bilevel_background_allowed_for_bucket(candidate, length_bucket)
                 ]
                 light_same_mode = [
                     candidate
@@ -523,21 +667,13 @@ def assign_document_augmentations(
                 item["document_augmentation_output_extension"] = ".jpg"
                 paper_counts["clean"] += 1
 
-            # Letterpress represents faded ink with grayscale values that can
-            # erase glyphs at the final 1-bit threshold, so use a
-            # contrast-preserving ink effect for bilevel pages.
+            # Keep bilevel real paper, but do not fade the ink first — mid-gray
+            # strokes vanish at the 1-bit threshold and pages look blank.
             if (
                 item["document_augmentation_output_mode"] == "1"
-                and item["document_augmentation_local"] == "letterpress"
+                and item["document_augmentation_local"] in BILEVEL_BANNED_LOCAL_EFFECTS
             ):
-                old_effect = str(item["document_augmentation_local"])
-                strength = str(item["document_augmentation_local_strength"])
-                old_key = f"{old_effect}:{strength}"
-                local_counts[old_key] -= 1
-                if local_counts[old_key] == 0:
-                    del local_counts[old_key]
-                item["document_augmentation_local"] = "inkbleed"
-                local_counts[f"inkbleed:{strength}"] += 1
+                _clear_local_effect_counts(item, local_counts)
 
             if index in ink_indices:
                 item["document_augmentation_spatial"] = "inkshifter"
@@ -604,6 +740,12 @@ def assign_document_augmentations(
                 item["document_augmentation_tps_strength"] = ""
                 item["document_augmentation_tps_y_norm"] = ""
                 item["document_augmentation_tps_offsets_height"] = ""
+
+            soften_long_page_augmentations(
+                item,
+                local_counts=local_counts,
+                paper_counts=paper_counts,
+            )
             prepared.append(item)
 
         font_summaries.append(
@@ -663,9 +805,21 @@ def assign_document_augmentations(
             "exclusive_sources": ["real", "synthetic", "clean"],
             "bilevel_encoding": "TIFF Group 4",
             "bilevel_local_effect_policy": {
-                "replaced_effects": ["letterpress"],
-                "replacement": "inkbleed",
-                "reason": "faded ink can lose glyphs at the 1-bit threshold",
+                "banned_effects": sorted(BILEVEL_BANNED_LOCAL_EFFECTS),
+                "replacement": "",
+                "reason": (
+                    "Ink-fading local effects push glyph pixels into mid-gray; "
+                    "on bilevel paper they vanish at the hard threshold and the "
+                    "page looks blank even though the background is fine."
+                ),
+            },
+            "bilevel_dense_page_policy": {
+                "buckets": sorted(DENSE_TEXT_LENGTH_BUCKETS),
+                "min_mean_luminance": BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE,
+                "reason": (
+                    "Darker bilevel scans bury middle/long text; require a high "
+                    "mean pixel luminance for those buckets."
+                ),
             },
             "readability_policy": {
                 "light_only_below_effective_text_scale": 36_000,
@@ -1031,8 +1185,15 @@ def _save_benchmark_image(
         output = Image.fromarray(image).convert("RGB")
         output.save(destination, format="JPEG", quality=jpeg_quality, subsampling=0)
     elif output_mode == "1":
-        grayscale = Image.fromarray(image).convert("L")
-        bilevel = grayscale.point(lambda value: 255 if value >= 128 else 0, mode="1")
+        grayscale = np.asarray(Image.fromarray(image).convert("L"), dtype=np.uint8)
+        # Safety net: any remaining non-paper ink must stay below the hard cut.
+        ink = grayscale < 245
+        if ink.any():
+            grayscale = grayscale.copy()
+            grayscale[ink] = np.minimum(grayscale[ink], 40)
+        bilevel = Image.fromarray(grayscale).point(
+            lambda value: 255 if value >= 128 else 0, mode="1"
+        )
         bilevel.save(destination, format="TIFF", compression="group4")
     else:
         output = Image.fromarray(image).convert("L")

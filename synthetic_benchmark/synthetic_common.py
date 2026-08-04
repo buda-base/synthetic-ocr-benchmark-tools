@@ -40,6 +40,26 @@ TSHEG = "་"
 SHAD = "།"
 TOC_TSHIG_RUN = TSHEG * 5
 EXCLUDED_SCRIPT_IDS = {"239"}
+
+# Simplified 4-way script taxonomy (v5+) derived from the catalog's
+# "classification guidelines category" column. Gyuyig+Tsugdri and Danyig+Pedri
+# are merged; Druma and Uchen map straight through; everything else (the
+# spreadsheet's "Non-applicable" faces) lands in the "other_tib" catch-all.
+SCRIPT_4_CATEGORIES = ("uchen", "druma", "danyig_pedri", "gyuyig_tsugdri")
+SCRIPT_4_OTHER = "other_tib"
+
+
+def classification_to_script_4(script_class: str) -> str:
+    text = (script_class or "").strip().lower()
+    if text in ("gyuyig", "tsugdri"):
+        return "gyuyig_tsugdri"
+    if text in ("danyig", "pedri"):
+        return "danyig_pedri"
+    if text == "druma":
+        return "druma"
+    if text == "uchen":
+        return "uchen"
+    return SCRIPT_4_OTHER
 DIFFICULTY_TOP_K = 10
 RARE_STACK_THRESHOLD = 0.8
 RARITY_IGNORED_MARKS = frozenset({"\u0f35", "\u0f37"})
@@ -60,6 +80,9 @@ class FontCatalogRow:
     script_category: str
     script_type: str
     script_name: str
+    script_class: str = ""
+    script_4: str = ""
+    volume_script: str = ""
 
 
 def ensure_repo_imports() -> None:
@@ -328,6 +351,7 @@ def load_font_catalog(
             size_meta = font_meta.get(font_path, {})
             basename = size_meta.get("basename") or Path(font_path).stem
             font_abs_path = BENCHMARK_DIR / font_path
+            script_class = meta.get("classification guidelines category", "").strip()
             rows.append(
                 FontCatalogRow(
                     basename=basename,
@@ -343,6 +367,8 @@ def load_font_catalog(
                     script_category=meta.get("8 categories", "").strip(),
                     script_type=meta.get("3 types", "").strip(),
                     script_name=meta.get("name (phonetics, Wylie in parentheses, and English)", "").strip(),
+                    script_class=script_class,
+                    script_4=classification_to_script_4(script_class),
                 )
             )
     return rows

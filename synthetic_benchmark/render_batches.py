@@ -496,6 +496,14 @@ end
 }}"""
 
 
+def _page_geometry_mm(row: dict[str, object], args: argparse.Namespace) -> tuple[float, float]:
+    if str(row.get("text_length_bucket") or "") == "long":
+        from length_buckets import LONG_MARGIN_X_MM, LONG_MARGIN_Y_MM
+
+        return LONG_MARGIN_X_MM, LONG_MARGIN_Y_MM
+    return float(args.margin_x_mm), float(args.margin_y_mm)
+
+
 def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_path: Path) -> str:
     first = rows[0]
     height = args.page_height_mm
@@ -510,7 +518,14 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
         )
         line_spacing_factor = float(row.get("layout_line_spacing_factor") or 1.25)
         baseline = font_size * line_spacing_factor
+        margin_x_mm, margin_y_mm = _page_geometry_mm(row, args)
         pages.append(
+            "\\newgeometry{"
+            f"left={fmt_dim(margin_x_mm)}mm,"
+            f"right={fmt_dim(margin_x_mm)}mm,"
+            f"top={fmt_dim(margin_y_mm)}mm,"
+            f"bottom={fmt_dim(margin_y_mm)}mm"
+            "}\n"
             "\\noindent\n"
             f"\\directlua{{synthetic_set_chunk(\"{row['render_id']}\")}}\n"
             f"\\fontsize{{{fmt_dim(font_size)}pt}}{{{fmt_dim(baseline)}pt}}\\selectfont\n"
@@ -707,12 +722,19 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
         str(second.get("source_text_repetition_policy") or ""),
     } - {""}
     if repetition_policies:
-        first["source_text_repetition_policy"] = (
-            "rewarded" if "rewarded" in repetition_policies else "penalized"
-        )
+        for policy in (
+            "highly_repetitive",
+            "repetitive",
+            "rewarded",
+            "penalized",
+        ):
+            if policy in repetition_policies:
+                first["source_text_repetition_policy"] = policy
+                break
         first["source_text_repetition_basis"] = (
             "high_repetition_preferred"
-            if first["source_text_repetition_policy"] == "rewarded"
+            if first["source_text_repetition_policy"]
+            in {"rewarded", "repetitive", "highly_repetitive"}
             else "low_repetition_preferred"
         )
     first["source_text_category_topup"] = max(
@@ -738,9 +760,19 @@ def merge_short_rows(
     i = 0
     while i < len(rows):
         row = init_source_fields(dict(rows[i]))
+        # Length-bucket short pages must stay sparse/mostly blank; never merge them.
+        if str(row.get("text_length_bucket") or "") == "short":
+            merged.append(row)
+            i += 1
+            continue
         pages = content_pages(pages_by_chunk.get(str(row["render_id"]), []))
+        next_is_short_bucket = (
+            i + 1 < len(rows)
+            and str(rows[i + 1].get("text_length_bucket") or "") == "short"
+        )
         is_short_single_page = (
             i + 1 < len(rows)
+            and not next_is_short_bucket
             and len(pages) == 1
             and pages[0]["line_count"] <= min_lines
         )
@@ -777,6 +809,71 @@ def set_render_size_fields(rows: list[dict[str, object]], font_scale: float) -> 
         row["rendered_font_size_pt"] = float(row["font_size_pt"]) * effective_scale
 
 
+def page_marker_count(
+    lines_by_chunk_page: dict[tuple[str, int], list[list[int]]],
+    render_id: str,
+    physical_page: int,
+) -> int:
+    return sum(
+        len(markers)
+        for markers in lines_by_chunk_page.get((render_id, physical_page), [])
+    )
+
+
+def long_row_needs_smaller_font(
+    row: dict[str, object],
+    pages_by_chunk: dict[str, list[dict[str, int]]],
+    lines_by_chunk_page: dict[tuple[str, int], list[list[int]]],
+    *,
+    min_syllables: int = 1000,
+) -> bool:
+    if str(row.get("text_length_bucket") or "") != "long":
+        return False
+    pages = content_pages(pages_by_chunk.get(str(row["render_id"]), []))
+    if not pages:
+        return True
+    if len(pages) > 1:
+        return True
+    first = pages[0]
+    markers = page_marker_count(
+        lines_by_chunk_page,
+        str(row["render_id"]),
+        int(first["physical_page"]),
+    )
+    return markers < min_syllables
+
+
+def shrink_long_row_fonts(
+    rows: list[dict[str, object]],
+    pages_by_chunk: dict[str, list[dict[str, int]]],
+    lines_by_chunk_page: dict[tuple[str, int], list[list[int]]],
+    *,
+    min_syllables: int = 1000,
+    shrink_factor: float = 0.82,
+    min_multiplier: float = 0.22,
+) -> bool:
+    """Reduce font scale for long rows that do not fit ≥min_syllables on one page."""
+    changed = False
+    for row in rows:
+        if not long_row_needs_smaller_font(
+            row,
+            pages_by_chunk,
+            lines_by_chunk_page,
+            min_syllables=min_syllables,
+        ):
+            continue
+        current = float(row.get("layout_font_scale_multiplier") or 1.0)
+        if current <= min_multiplier + 1e-9:
+            continue
+        row["layout_font_scale_multiplier"] = round(
+            max(min_multiplier, current * shrink_factor),
+            6,
+        )
+        row["layout_density_tier"] = "long_dense"
+        changed = True
+    return changed
+
+
 def add_prefix_to_alternating_pages(
     rows: list[dict[str, object]],
     *,
@@ -791,7 +888,12 @@ def add_prefix_to_alternating_pages(
             output_id = int(item.get("image_id") or start_output_id + i)
         except (TypeError, ValueError):
             output_id = start_output_id + i
-        should_prefix = enabled and output_id % 2 == 1
+        # Keep short-bucket pages visually mostly blank: no decorative page head.
+        should_prefix = (
+            enabled
+            and output_id % 2 == 1
+            and str(item.get("text_length_bucket") or "") != "short"
+        )
         text = str(item["text"]).strip()
         if should_prefix and "༄" not in text[:5]:
             item["text"] = f"{prefix}{text}"
@@ -939,6 +1041,8 @@ def write_text_and_catalog(
                 "script_id": row["script_id"],
                 "script_category": row["script_category"],
                 "script_8": row.get("script_8") or row.get("script_category") or "",
+                "script_4": row.get("script_4") or "",
+                "script_class": row.get("script_class") or "",
                 "script_type": row["script_type"],
                 "script": row.get("script") or normalized_script(str(row.get("script_type") or "")),
                 "etext_source": "|".join(row.get("_source_etext_sources") or [str(row.get("etext_source") or "")]),
@@ -1201,7 +1305,13 @@ def render_batch(
     compile_result = None
     pages_by_chunk: dict[str, list[dict[str, int]]] = {}
     lines_by_chunk_page: dict[tuple[str, int], list[list[int]]] = {}
-    for attempt in range(1, args.max_merge_passes + 2):
+    has_long_rows = any(
+        str(row.get("text_length_bucket") or "") == "long" for row in render_rows
+    )
+    max_fit_attempts = args.max_merge_passes + 2
+    if has_long_rows:
+        max_fit_attempts = max(max_fit_attempts, 14)
+    for attempt in range(1, max_fit_attempts + 1):
         assign_render_ids(render_rows)
         compile_rows = add_prefix_to_alternating_pages(
             render_rows,
@@ -1222,6 +1332,13 @@ def render_batch(
         pages_by_chunk, lines_by_chunk_page, _pdf_path = compile_result
         render_rows = compile_rows
         set_render_size_fields(render_rows, args.font_scale)
+        if shrink_long_row_fonts(
+            render_rows,
+            pages_by_chunk,
+            lines_by_chunk_page,
+            min_syllables=1000,
+        ):
+            continue
         merged_rows, changed = merge_short_rows(
             render_rows,
             pages_by_chunk,
@@ -1594,6 +1711,7 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "layout_density_tier": str(row.get("layout_density_tier") or ""),
                 "font_name": str(row.get("font_name") or ""),
                 "script_8": str(row.get("script_8") or ""),
+                "4 scripts": str(row.get("script_4") or ""),
                 "etext_source": str(row.get("etext_source") or ""),
                 "stack_difficulty_score": (
                     float(row["stack_difficulty_score"])
@@ -1776,13 +1894,15 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
         "size and rendered line density. Line spacing varies per page, with local "
         "glyph-aware clearance for unusually tall stacks. The rendered transcription preserves line breaks recovered "
         "from LuaTeX line markers. The alignment parquet files contain page-to-text rows "
-        "plus synthetic metadata: `font_name`, `script_8`, `etext_source`, "
+        "plus synthetic metadata: `font_name`, `script_8`, `4 scripts`, `etext_source`, "
         "`stack_difficulty_score`, `suggested_split`, and—when enabled—deterministic "
         "font and document augmentation fields.\n\n"
         "## Planning and Splits\n\n"
-        "The render plan aims for a balanced distribution across the 8-way Tibetan script "
-        "classification (`script_8`) while keeping image volumes pure with respect to "
-        "`uchen` versus `ume`. Split assignment is by font name: a font appears in only "
+        "The render plan aims for a balanced distribution across a simplified 4-way Tibetan "
+        "script classification (`4 scripts`: `uchen`, `druma`, `danyig_pedri`, "
+        "`gyuyig_tsugdri`) while keeping image volumes pure with respect to "
+        "`uchen` versus `ume`. The finer 8-way classification (`script_8`) is retained for "
+        "reference. Split assignment is by font name: a font appears in only "
         "one of `train`, `val`, or `test`. Each font face receives an equal mix of normal "
         "source text without rare stacks and difficult text prioritizing rare stacks, before "
         "text augmentation. Fonts without enough compatible rare text use their most "
@@ -2111,6 +2231,27 @@ def main() -> None:
         low_jpeg_quality_rate=args.low_jpeg_quality_rate,
         seed=args.image_output_seed,
     )
+    from length_buckets import LONG_OUTPUT_RESOLUTION_SCALE
+
+    long_scaled = 0
+    for row in rows:
+        if str(row.get("text_length_bucket") or "") != "long":
+            row["output_resolution_scale"] = 1.0
+            continue
+        base_width = int(row["output_width_px"])
+        row["output_width_px"] = max(
+            1, int(round(base_width * LONG_OUTPUT_RESOLUTION_SCALE))
+        )
+        row["output_resolution_scale"] = LONG_OUTPUT_RESOLUTION_SCALE
+        long_scaled += 1
+    if rows:
+        args.raster_width_px = max(
+            int(args.raster_width_px),
+            max(int(row["output_width_px"]) for row in rows),
+        )
+    image_output_manifest["long_output_resolution_scale"] = LONG_OUTPUT_RESOLUTION_SCALE
+    image_output_manifest["long_pages_scaled"] = long_scaled
+    image_output_manifest["raster_width_px"] = int(args.raster_width_px)
     image_output_manifest_path = args.out_dir / "image_output_manifest.json"
     image_output_manifest_path.write_text(
         json.dumps(image_output_manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -2121,6 +2262,11 @@ def main() -> None:
         f"{args.max_image_width_px}px; JPEG quality {args.jpeg_quality} with "
         f"{args.low_jpeg_quality_rate:.1%} at quality {args.low_jpeg_quality}"
     )
+    if long_scaled:
+        print(
+            f"Scaled {long_scaled} long page(s) by {LONG_OUTPUT_RESOLUTION_SCALE}× "
+            f"(pdftoppm raster width {args.raster_width_px}px)"
+        )
     print(f"Wrote {image_output_manifest_path}")
     from page_layout_policy import assign_page_layout_parameters
 
@@ -2130,6 +2276,20 @@ def main() -> None:
         max_line_spacing_factor=args.max_line_spacing_factor,
         seed=args.line_spacing_seed,
     )
+    # Short pages stay at the catalog/usual size; long pages start there and may
+    # shrink later so ≥1000 syllables fit on a single pecha page.
+    for row in rows:
+        bucket = str(row.get("text_length_bucket") or "normal")
+        if bucket == "short":
+            row["layout_font_scale_multiplier"] = 1.0
+            row["layout_density_tier"] = "short_sparse"
+        elif bucket == "long":
+            row["layout_font_scale_multiplier"] = 1.0
+            row["layout_density_tier"] = "long_dense"
+            # Prefer slightly tighter leading so shrunk glyphs stay denser/legible.
+            base_spacing = float(row.get("layout_base_line_spacing_factor") or 1.22)
+            row["layout_line_spacing_factor"] = round(min(base_spacing, 1.20), 6)
+            row["layout_stack_spacing_extra"] = 0.0
     page_layout_manifest["collision_policy"]["clearance_pt"] = (
         args.line_collision_clearance_pt
     )

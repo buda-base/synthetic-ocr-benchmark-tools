@@ -12,12 +12,21 @@ from build_render_plan import (  # noqa: E402
     chunk_difficulty_tier,
     filter_chunks_by_text_policy,
     make_per_font_plan_rows,
+    make_plan_rows,
     parse_category_quotas,
+    prepare_script_4_fonts,
+    requested_repetition_policy_for_slot,
+    retention_chunks_for_repetition_bands,
+    script_4_category_of,
     text_repetition_score,
     top_up_category_quotas,
+    volume_aware_script_of,
     zstd_compression_ratio,
 )
-from synthetic_common import FontCatalogRow  # noqa: E402
+from synthetic_common import (  # noqa: E402
+    FontCatalogRow,
+    classification_to_script_4,
+)
 
 
 def sample_chunks() -> list[dict[str, object]]:
@@ -66,6 +75,105 @@ def sample_font() -> FontCatalogRow:
         script_type="uchen",
         script_name="Test",
     )
+
+
+def make_font(
+    basename: str,
+    *,
+    script_class: str,
+    script_type: str,
+    script_category: str = "",
+    script_4: str = "",
+) -> FontCatalogRow:
+    return FontCatalogRow(
+        basename=basename,
+        font_file=f"{basename}.ttf",
+        font_path=f"fonts/{basename}.ttf",
+        font_abs_path=Path(f"/tmp/{basename}.ttf"),
+        ps_name=basename,
+        ttc_face_index="",
+        font_size_pt=24.0,
+        dpi=300,
+        skt_ok="y",
+        script_id="1",
+        script_category=script_category or script_class,
+        script_type=script_type,
+        script_name=basename,
+        script_class=script_class,
+        script_4=script_4 or classification_to_script_4(script_class),
+    )
+
+
+class Script4TaxonomyTests(unittest.TestCase):
+    def test_classification_merges_into_four_way_plus_other(self) -> None:
+        self.assertEqual(classification_to_script_4("Gyuyig"), "gyuyig_tsugdri")
+        self.assertEqual(classification_to_script_4("Tsugdri"), "gyuyig_tsugdri")
+        self.assertEqual(classification_to_script_4("Danyig"), "danyig_pedri")
+        self.assertEqual(classification_to_script_4("Pedri"), "danyig_pedri")
+        self.assertEqual(classification_to_script_4("Druma"), "druma")
+        self.assertEqual(classification_to_script_4("Uchen"), "uchen")
+        self.assertEqual(classification_to_script_4("Non-applicable"), "other_tib")
+        self.assertEqual(classification_to_script_4(""), "other_tib")
+
+    def test_prepare_drops_other_tib_except_bhozuk_override(self) -> None:
+        fonts = [
+            make_font("Keeper_Uchen", script_class="Uchen", script_type="Uchen"),
+            make_font("Drop_Sans", script_class="Non-applicable", script_type="Uchen"),
+            make_font(
+                "Bhozuk_Dunhuang_B",
+                script_class="Non-applicable",
+                script_type="Transitional",
+                script_category="Nama (Early Printscripts)",
+            ),
+        ]
+        prepared = prepare_script_4_fonts(fonts)
+        by_name = {font.basename: font for font in prepared}
+        self.assertNotIn("Drop_Sans", by_name)
+        self.assertIn("Keeper_Uchen", by_name)
+        bhozuk = by_name["Bhozuk_Dunhuang_B"]
+        self.assertEqual(script_4_category_of(bhozuk), "uchen")
+        self.assertEqual(volume_aware_script_of(bhozuk), "uchen")
+        # Real 8-way / script_type fields are preserved for reference.
+        self.assertEqual(bhozuk.script_category, "Nama (Early Printscripts)")
+        self.assertEqual(bhozuk.script_type, "Transitional")
+
+    def test_make_plan_rows_balances_by_script_4(self) -> None:
+        chunks = sample_chunks()
+        # Three fonts per category (one per train/val/test slot) so split
+        # rounding does not starve a slice.
+        fonts = prepare_script_4_fonts(
+            [
+                make_font("U1", script_class="Uchen", script_type="Uchen"),
+                make_font("U2", script_class="Uchen", script_type="Uchen"),
+                make_font("U3", script_class="Uchen", script_type="Uchen"),
+                make_font("D1", script_class="Druma", script_type="Ume"),
+                make_font("D2", script_class="Druma", script_type="Ume"),
+                make_font("D3", script_class="Druma", script_type="Ume"),
+                make_font("Skip", script_class="Non-applicable", script_type="Uchen"),
+            ]
+        )
+        supported = {
+            font.basename: {f"stack-{index}" for index in range(20)} for font in fonts
+        }
+        rows = make_plan_rows(
+            fonts=fonts,
+            chunks=chunks,
+            supported=supported,
+            target_images=12,
+            seed=13,
+            max_chunk_reuse_ratio=0.10,
+            category_of=script_4_category_of,
+            script_of=volume_aware_script_of,
+        )
+        counts = Counter(str(row["script_4"]) for row in rows)
+        # The two populated categories are balanced against each other.
+        self.assertEqual(set(counts), {"uchen", "druma"})
+        self.assertEqual(counts["uchen"], counts["druma"])
+        self.assertGreater(counts["uchen"], 0)
+        # The dropped Non-applicable font never appears.
+        self.assertNotIn("Skip", {str(row["basename"]) for row in rows})
+        # script_8 is still populated for reference alongside script_4.
+        self.assertTrue(all(row["script_8"] for row in rows))
 
 
 class RenderPlanDifficultyTests(unittest.TestCase):
@@ -205,6 +313,51 @@ class RenderPlanDifficultyTests(unittest.TestCase):
             Counter(row["source_text_repetition_policy"] for row in rows),
             Counter({"penalized": 10}),
         )
+
+    def test_repetition_slot_fractions_are_deterministic(self) -> None:
+        policies = [
+            requested_repetition_policy_for_slot(
+                slot,
+                reward_repetition=False,
+                repetitive_fraction=0.07,
+                highly_repetitive_fraction=0.03,
+            )
+            for slot in range(1000)
+        ]
+        counts = Counter(policies)
+        self.assertEqual(counts["highly_repetitive"], 30)
+        self.assertEqual(counts["repetitive"], 70)
+        self.assertEqual(counts["penalized"], 900)
+
+    def test_retention_keeps_high_repetition_bands_when_requested(self) -> None:
+        chunks = [
+            {
+                "chunk_id": "low",
+                "text_repetition_score": 0.10,
+                "zstd_compression_ratio": 0.40,
+            },
+            {
+                "chunk_id": "mid",
+                "text_repetition_score": 0.40,
+                "zstd_compression_ratio": 0.10,
+            },
+            {
+                "chunk_id": "high",
+                "text_repetition_score": 0.80,
+                "zstd_compression_ratio": 0.05,
+            },
+        ]
+        retained = retention_chunks_for_repetition_bands(
+            chunks,
+            max_repetition_score=0.50,
+            min_zstd_compression_ratio=0.18,
+            repetitive_fraction=0.07,
+            highly_repetitive_fraction=0.03,
+            repetitive_min_score=0.30,
+            highly_repetitive_min_score=0.50,
+        )
+        ids = {str(chunk["chunk_id"]) for chunk in retained}
+        self.assertEqual(ids, {"low", "mid", "high"})
 
     def test_text_policy_applies_hard_repetition_and_density_guards(self) -> None:
         chunks = sample_chunks()

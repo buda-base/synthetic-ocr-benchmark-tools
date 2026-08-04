@@ -8,16 +8,21 @@ import csv
 import random
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 import zstandard as zstd
 
-from shorthand_aug import mode_for_script
+from length_buckets import (
+    DEFAULT_LONG_FRACTION,
+    DEFAULT_SHORT_FRACTION,
+    apply_length_bucket_rewrites,
+)
+from shorthand_aug import mode_for_script, syllable_count
 from synthetic_common import (
     DEFAULT_BENCHMARK_CSV,
     DEFAULT_CHUNKS_PARQUET,
@@ -25,7 +30,9 @@ from synthetic_common import (
     DEFAULT_RENDER_PLAN,
     DEFAULT_SCRIPTS_CSV,
     RARE_STACK_THRESHOLD,
+    SCRIPT_4_OTHER,
     FontCatalogRow,
+    classification_to_script_4,
     has_tibetan_letter,
     load_font_catalog,
     load_stack_rarity_scores,
@@ -53,6 +60,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scripts-csv", type=Path, default=DEFAULT_SCRIPTS_CSV)
     parser.add_argument("--fonts-csv", type=Path, default=DEFAULT_FONTS_CSV)
     parser.add_argument("--target-images", type=int, default=500_000)
+    parser.add_argument(
+        "--balance-by",
+        choices=("script_8", "script_4"),
+        default="script_8",
+        help=(
+            "Category axis used to balance the plan. 'script_8' (default) uses the "
+            "8-way taxonomy; 'script_4' uses the simplified 4-way taxonomy "
+            "(uchen / druma / danyig_pedri / gyuyig_tsugdri). In script_4 mode, "
+            "'Non-applicable' faces are dropped except for per-font overrides."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--batch-size", type=int, default=5000)
     parser.add_argument("--max-chunk-reuse-ratio", type=float, default=0.10)
@@ -75,6 +93,37 @@ def parse_args() -> argparse.Namespace:
         "--disable-rewarded-repetition",
         action="store_true",
         help="Use low-repetition selection for every slot; never reward repetition.",
+    )
+    parser.add_argument(
+        "--repetitive-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of plan slots that prefer mid-band repetitive chunks "
+            "(score in [--repetitive-min-score, --highly-repetitive-min-score))."
+        ),
+    )
+    parser.add_argument(
+        "--highly-repetitive-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of plan slots that prefer highly repetitive chunks "
+            "(score >= --highly-repetitive-min-score). Zstd density floor is "
+            "not applied to these bands."
+        ),
+    )
+    parser.add_argument(
+        "--repetitive-min-score",
+        type=float,
+        default=0.30,
+        help="Lower bound (inclusive) for the mid-band repetitive pool.",
+    )
+    parser.add_argument(
+        "--highly-repetitive-min-score",
+        type=float,
+        default=0.50,
+        help="Lower bound (inclusive) for the highly repetitive pool.",
     )
     parser.add_argument(
         "--category-quota",
@@ -120,6 +169,24 @@ def parse_args() -> argparse.Namespace:
             "Intended for --images-per-font 2 smoke plans."
         ),
     )
+    parser.add_argument(
+        "--short-length-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "After planning, rewrite this fraction of rows to very short text "
+            f"(≤10 syllables ending with shad). Default 0; v4 uses {DEFAULT_SHORT_FRACTION}."
+        ),
+    )
+    parser.add_argument(
+        "--long-length-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "After planning, rewrite this fraction of rows to very long text "
+            f"(≥1000 syllables by merging chunks). Default 0; v4 uses {DEFAULT_LONG_FRACTION}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -140,6 +207,50 @@ def normalized_script(value: str) -> str:
 
 def font_name(font: FontCatalogRow) -> str:
     return font.ps_name or font.basename or font.font_file
+
+
+# Per-font overrides for the simplified 4-way taxonomy (script_4 mode).
+# Each entry maps a font basename to its forced 4-script category and, when the
+# font's real script_type would route it to the wrong image volume, an explicit
+# uchen/ume volume. Fonts mapped to "other_tib" that are NOT listed here are
+# dropped from script_4 plans.
+SCRIPT_4_FONT_OVERRIDES: dict[str, dict[str, str]] = {
+    # Early Dunhuang "Bhozuk" face folded into uchen (category + image volume),
+    # even though its catalog script_type is Transitional.
+    "Bhozuk_Dunhuang_B": {"script_4": "uchen", "volume_script": "uchen"},
+}
+
+
+def prepare_script_4_fonts(fonts: list[FontCatalogRow]) -> list[FontCatalogRow]:
+    """Apply the 4-way taxonomy: drop other_tib faces except explicit overrides."""
+    prepared: list[FontCatalogRow] = []
+    for font in fonts:
+        script_4 = font.script_4 or classification_to_script_4(font.script_class)
+        volume_script = ""
+        override = SCRIPT_4_FONT_OVERRIDES.get(font.basename)
+        if override is not None:
+            script_4 = override.get("script_4", script_4)
+            volume_script = override.get("volume_script", "")
+        elif script_4 == SCRIPT_4_OTHER:
+            continue
+        prepared.append(replace(font, script_4=script_4, volume_script=volume_script))
+    return prepared
+
+
+def default_category_of(font: FontCatalogRow) -> str:
+    return font.script_category
+
+
+def script_4_category_of(font: FontCatalogRow) -> str:
+    return font.script_4
+
+
+def default_script_of(font: FontCatalogRow) -> str:
+    return normalized_script(font.script_type)
+
+
+def volume_aware_script_of(font: FontCatalogRow) -> str:
+    return font.volume_script or normalized_script(font.script_type)
 
 
 def zstd_compression_ratio(text: str) -> float:
@@ -242,6 +353,99 @@ def filter_chunks_by_text_policy(
     ]
 
 
+def chunk_repetition_score(chunk: dict[str, object]) -> float:
+    if chunk.get("text_repetition_score") is not None:
+        return float(chunk["text_repetition_score"])
+    return text_repetition_score(str(chunk.get("text") or ""))
+
+
+def retention_chunks_for_repetition_bands(
+    chunks: list[dict[str, object]],
+    *,
+    max_repetition_score: float | None,
+    min_zstd_compression_ratio: float | None,
+    repetitive_fraction: float,
+    highly_repetitive_fraction: float,
+    repetitive_min_score: float,
+    highly_repetitive_min_score: float,
+) -> list[dict[str, object]]:
+    """Retain normal-policy chunks plus optional mid/high repetition bands."""
+    if repetitive_fraction < 0 or highly_repetitive_fraction < 0:
+        raise ValueError("Repetition fractions must be non-negative")
+    if repetitive_fraction + highly_repetitive_fraction > 1:
+        raise ValueError("Repetition fractions must sum to ≤ 1")
+    if repetitive_min_score > highly_repetitive_min_score:
+        raise ValueError("repetitive-min-score must be ≤ highly-repetitive-min-score")
+
+    if repetitive_fraction <= 0 and highly_repetitive_fraction <= 0:
+        return filter_chunks_by_text_policy(
+            chunks,
+            max_repetition_score=max_repetition_score,
+            min_zstd_compression_ratio=min_zstd_compression_ratio,
+        )
+
+    # Normal slots stay below the mid-band and still obey the Zstd floor.
+    normal_max = repetitive_min_score
+    if max_repetition_score is not None:
+        normal_max = min(max_repetition_score, repetitive_min_score)
+    retained: dict[str, dict[str, object]] = {
+        str(chunk["chunk_id"]): chunk
+        for chunk in filter_chunks_by_text_policy(
+            chunks,
+            max_repetition_score=normal_max,
+            min_zstd_compression_ratio=min_zstd_compression_ratio,
+        )
+    }
+    for chunk in chunks:
+        score = chunk_repetition_score(chunk)
+        chunk_id = str(chunk["chunk_id"])
+        if (
+            repetitive_fraction > 0
+            and repetitive_min_score <= score < highly_repetitive_min_score
+        ):
+            retained[chunk_id] = chunk
+        elif highly_repetitive_fraction > 0 and score >= highly_repetitive_min_score:
+            retained[chunk_id] = chunk
+    return list(retained.values())
+
+
+def requested_repetition_policy_for_slot(
+    slot: int,
+    *,
+    reward_repetition: bool,
+    repetitive_fraction: float,
+    highly_repetitive_fraction: float,
+) -> str:
+    """Deterministic slot → repetition policy (cycle of 1000)."""
+    if repetitive_fraction > 0 or highly_repetitive_fraction > 0:
+        cycle = 1000
+        highly_n = int(round(highly_repetitive_fraction * cycle))
+        repetitive_n = int(round(repetitive_fraction * cycle))
+        idx = slot % cycle
+        if idx < highly_n:
+            return "highly_repetitive"
+        if idx < highly_n + repetitive_n:
+            return "repetitive"
+        return "penalized"
+    return "rewarded" if reward_repetition and slot % 10 == 9 else "penalized"
+
+
+def repetition_policy_fallbacks(policy: str) -> tuple[str, ...]:
+    if policy == "highly_repetitive":
+        return ("highly_repetitive", "repetitive", "penalized")
+    if policy == "repetitive":
+        return ("repetitive", "penalized")
+    if policy == "rewarded":
+        return ("rewarded", "penalized")
+    return (policy,)
+
+
+def repetition_basis_for_policy(policy: str) -> str:
+    if policy in {"rewarded", "repetitive", "highly_repetitive"}:
+        return "high_repetition_preferred"
+    return "low_repetition_preferred"
+
+
 def font_supports_chunk(font: FontCatalogRow, chunk: dict[str, object], supported: dict[str, set[str]]) -> bool:
     stacks = chunk["_stack_set"]
     if not stacks:
@@ -294,6 +498,8 @@ def text_repetition_score(text: str) -> float:
 
 def build_difficulty_pools(
     chunks: list[dict[str, object]],
+    repetitive_min_score: float | None = None,
+    highly_repetitive_min_score: float | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     normal_chunks = [
         chunk for chunk in chunks if chunk_difficulty_tier(chunk) == "normal"
@@ -324,21 +530,51 @@ def build_difficulty_pools(
             key=lambda row: (-float(row["stack_difficulty_score"]), str(row["chunk_id"])),
         ),
     }
+    banded = (
+        repetitive_min_score is not None and highly_repetitive_min_score is not None
+    )
     for tier, pool in list(pools.items()):
         pools[f"{tier}_penalized_repetition"] = sorted(
-            pool,
-            key=lambda row: (
-                float(
-                    row.get("text_repetition_score")
-                    if row.get("text_repetition_score") is not None
-                    else text_repetition_score(str(row.get("text") or ""))
-                ),
-                str(row["chunk_id"]),
+            (
+                [
+                    row
+                    for row in pool
+                    if chunk_repetition_score(row) < float(repetitive_min_score)
+                ]
+                if banded
+                else pool
             ),
+            key=lambda row: (chunk_repetition_score(row), str(row["chunk_id"])),
         )
         pools[f"{tier}_rewarded_repetition"] = list(
-            reversed(pools[f"{tier}_penalized_repetition"])
+            reversed(
+                sorted(
+                    pool,
+                    key=lambda row: (chunk_repetition_score(row), str(row["chunk_id"])),
+                )
+            )
         )
+        if banded:
+            mid = [
+                row
+                for row in pool
+                if float(repetitive_min_score)
+                <= chunk_repetition_score(row)
+                < float(highly_repetitive_min_score)
+            ]
+            high = [
+                row
+                for row in pool
+                if chunk_repetition_score(row) >= float(highly_repetitive_min_score)
+            ]
+            pools[f"{tier}_repetitive_repetition"] = sorted(
+                mid,
+                key=lambda row: (-chunk_repetition_score(row), str(row["chunk_id"])),
+            )
+            pools[f"{tier}_highly_repetitive_repetition"] = sorted(
+                high,
+                key=lambda row: (-chunk_repetition_score(row), str(row["chunk_id"])),
+            )
     return pools
 
 
@@ -367,11 +603,12 @@ def assign_font_splits(
     fonts: list[FontCatalogRow],
     supported: dict[str, set[str]],
     rng: random.Random,
+    category_of: Callable[[FontCatalogRow], str] = default_category_of,
 ) -> dict[str, str]:
-    """Assign each font_name to one split, balancing estimated capacity by script_8."""
+    """Assign each font_name to one split, balancing estimated capacity by category."""
     by_script_8: dict[str, list[FontCatalogRow]] = defaultdict(list)
     for font in fonts:
-        by_script_8[font.script_category].append(font)
+        by_script_8[category_of(font)].append(font)
 
     split_by_font_name: dict[str, str] = {}
     for _script_8, script_fonts in sorted(by_script_8.items()):
@@ -463,7 +700,13 @@ def next_chunk_for_font(
         rarity_gain = sum(float(rarity_weights.get(stack, 1.0)) for stack in new_stacks)
         repetition = float(chunk.get("text_repetition_score") or 0.0)
         repetition_utility = (
-            repetition if "_rewarded_repetition" in tier else 1.0 - repetition
+            repetition
+            if (
+                "_rewarded_repetition" in tier
+                or "_repetitive_repetition" in tier
+                or "_highly_repetitive_repetition" in tier
+            )
+            else 1.0 - repetition
         )
         coverage_score = (
             0.45 * min(len(new_stacks), 4) / 4
@@ -506,7 +749,13 @@ def next_chunk_for_font(
             rarity_gain = sum(float(weights.get(stack, 1.0)) for stack in new_stacks)
             repetition = float(chunk.get("text_repetition_score") or 0.0)
             repetition_utility = (
-                repetition if "_rewarded_repetition" in tier else 1.0 - repetition
+                repetition
+                if (
+                    "_rewarded_repetition" in tier
+                    or "_repetitive_repetition" in tier
+                    or "_highly_repetitive_repetition" in tier
+                )
+                else 1.0 - repetition
             )
             score = (
                 0.45 * min(len(new_stacks), 4) / 4
@@ -582,10 +831,8 @@ def _plan_row_dict(
             chunk.get("zstd_compression_ratio") or 0.0
         ),
         "source_text_repetition_policy": requested_text_repetition_policy,
-        "source_text_repetition_basis": (
-            "high_repetition_preferred"
-            if requested_text_repetition_policy == "rewarded"
-            else "low_repetition_preferred"
+        "source_text_repetition_basis": repetition_basis_for_policy(
+            requested_text_repetition_policy
         ),
         "source_text_coverage_policy": "bounded_greedy_rare_stack_coverage",
         "source_text_new_rare_stack_count": int(
@@ -613,6 +860,8 @@ def _plan_row_dict(
         "script_id": font.script_id,
         "script_category": font.script_category,
         "script_8": font.script_category,
+        "script_4": font.script_4,
+        "script_class": font.script_class,
         "script_type": font.script_type,
         "script": script,
         "script_name": font.script_name,
@@ -622,6 +871,8 @@ def _plan_row_dict(
         "suggested_split": split,
         "ume_dense_oversampled": 0,
         "shorthand_mode": "",
+        "text_length_bucket": "normal",
+        "syllable_count": syllable_count(str(chunk.get("text") or "")),
     }
 
 
@@ -660,6 +911,10 @@ def make_per_font_plan_rows(
     oversample_ume_dense: bool = False,
     pair_shorthand_modes: bool = False,
     reward_repetition: bool = True,
+    repetitive_fraction: float = 0.0,
+    highly_repetitive_fraction: float = 0.0,
+    repetitive_min_score: float = 0.30,
+    highly_repetitive_min_score: float = 0.50,
 ) -> list[dict[str, object]]:
     """Allocate exactly ``images_per_font`` coverage-compatible chunks per font."""
     if images_per_font <= 0:
@@ -671,7 +926,12 @@ def make_per_font_plan_rows(
         if font.basename in supported and font.script_category and normalized_script(font.script_type)
     ]
     split_by_font_name = assign_font_splits(eligible_fonts, supported, rng)
-    difficulty_pools = build_difficulty_pools(chunks)
+    banded = repetitive_fraction > 0 or highly_repetitive_fraction > 0
+    difficulty_pools = build_difficulty_pools(
+        chunks,
+        repetitive_min_score=repetitive_min_score if banded else None,
+        highly_repetitive_min_score=highly_repetitive_min_score if banded else None,
+    )
 
     rows: list[dict[str, object]] = []
     used_font_chunks: set[tuple[str, str]] = set()
@@ -700,32 +960,42 @@ def make_per_font_plan_rows(
         for slot in range(images_per_font):
             chunk = None
             requested_tier = "normal" if slot % 2 == 0 else "difficult"
-            requested_repetition_policy = (
-                "rewarded" if reward_repetition and slot % 10 == 9 else "penalized"
+            requested_repetition_policy = requested_repetition_policy_for_slot(
+                slot,
+                reward_repetition=reward_repetition,
+                repetitive_fraction=repetitive_fraction,
+                highly_repetitive_fraction=highly_repetitive_fraction,
             )
+            selected_repetition_policy = requested_repetition_policy
             candidate_tiers = (
                 ("difficult", "relative_difficult")
                 if requested_tier == "difficult"
                 else ("normal", "difficult")
             )
             for tier in candidate_tiers:
-                pool_key = f"{tier}_{requested_repetition_policy}_repetition"
-                for allow_reuse in (False, True):
-                    chunk = next_chunk_for_font(
-                        font_info,
-                        difficulty_pools[pool_key],
-                        supported,
-                        used_font_chunks,
-                        chunk_split,
-                        chunk_use_counts,
-                        reused_chunk_ids,
-                        max_reused_chunks,
-                        cursors,
-                        pending_candidates,
-                        covered_rare_stacks,
-                        tier=pool_key,
-                        allow_reuse=allow_reuse,
-                    )
+                for policy in repetition_policy_fallbacks(requested_repetition_policy):
+                    pool_key = f"{tier}_{policy}_repetition"
+                    if pool_key not in difficulty_pools:
+                        continue
+                    for allow_reuse in (False, True):
+                        chunk = next_chunk_for_font(
+                            font_info,
+                            difficulty_pools[pool_key],
+                            supported,
+                            used_font_chunks,
+                            chunk_split,
+                            chunk_use_counts,
+                            reused_chunk_ids,
+                            max_reused_chunks,
+                            cursors,
+                            pending_candidates,
+                            covered_rare_stacks,
+                            tier=pool_key,
+                            allow_reuse=allow_reuse,
+                        )
+                        if chunk is not None:
+                            selected_repetition_policy = policy
+                            break
                     if chunk is not None:
                         break
                 if chunk is not None:
@@ -746,7 +1016,7 @@ def make_per_font_plan_rows(
                     script=script,
                     split=split,
                     requested_text_difficulty_tier=requested_tier,
-                    requested_text_repetition_policy=requested_repetition_policy,
+                    requested_text_repetition_policy=selected_repetition_policy,
                     selected_pool=tier,
                 )
             )
@@ -807,17 +1077,28 @@ def make_plan_rows(
     oversample_ume_dense: bool = False,
     reward_repetition: bool = True,
     category_quota_overrides: dict[str, int] | None = None,
+    repetitive_fraction: float = 0.0,
+    highly_repetitive_fraction: float = 0.0,
+    repetitive_min_score: float = 0.30,
+    highly_repetitive_min_score: float = 0.50,
+    category_of: Callable[[FontCatalogRow], str] = default_category_of,
+    script_of: Callable[[FontCatalogRow], str] = default_script_of,
 ) -> list[dict[str, object]]:
     rng = random.Random(seed)
     eligible_fonts = [
         font
         for font in fonts
-        if font.basename in supported and font.script_category and normalized_script(font.script_type)
+        if font.basename in supported and category_of(font) and script_of(font)
     ]
-    split_by_font_name = assign_font_splits(eligible_fonts, supported, rng)
+    split_by_font_name = assign_font_splits(eligible_fonts, supported, rng, category_of)
 
-    difficulty_pools = build_difficulty_pools(chunks)
-    categories = sorted({font.script_category for font in eligible_fonts})
+    banded = repetitive_fraction > 0 or highly_repetitive_fraction > 0
+    difficulty_pools = build_difficulty_pools(
+        chunks,
+        repetitive_min_score=repetitive_min_score if banded else None,
+        highly_repetitive_min_score=highly_repetitive_min_score if banded else None,
+    )
+    categories = sorted({category_of(font) for font in eligible_fonts})
     quotas = category_quota_overrides or category_quotas(categories, target_images)
     if set(quotas) != set(categories) or sum(quotas.values()) != target_images:
         raise ValueError(
@@ -830,12 +1111,12 @@ def make_plan_rows(
     for font in fonts:
         name = font_name(font)
         split = split_by_font_name.get(name)
-        if split and font.basename in supported and font.script_category:
+        if split and font.basename in supported and category_of(font):
             info = FontPlanInfo(font=font, split=split)
-            key = (font.script_category, normalized_script(font.script_type), split)
+            key = (category_of(font), script_of(font), split)
             fonts_by_category_script_split[key].append(info)
             split_font_counts[split] += 1
-            script_font_counts[(font.script_category, normalized_script(font.script_type), split)] += 1
+            script_font_counts[(category_of(font), script_of(font), split)] += 1
 
     rows: list[dict[str, object]] = []
     used_font_chunks: set[tuple[str, str]] = set()
@@ -879,36 +1160,44 @@ def make_plan_rows(
                             else "difficult"
                         )
                         font_slot = font_counts["normal"] + font_counts["difficult"]
-                        requested_repetition_policy = (
-                            "rewarded"
-                            if reward_repetition and font_slot % 10 == 9
-                            else "penalized"
+                        requested_repetition_policy = requested_repetition_policy_for_slot(
+                            font_slot,
+                            reward_repetition=reward_repetition,
+                            repetitive_fraction=repetitive_fraction,
+                            highly_repetitive_fraction=highly_repetitive_fraction,
                         )
                         chunk = None
+                        selected_repetition_policy = requested_repetition_policy
                         for tier in (
                             ("difficult", "relative_difficult")
                             if requested_tier == "difficult"
                             else ("normal", "difficult")
                         ):
-                            pool_key = (
-                                f"{tier}_{requested_repetition_policy}_repetition"
-                            )
-                            for allow_reuse in (False, True):
-                                chunk = next_chunk_for_font(
-                                    font_info,
-                                    difficulty_pools[pool_key],
-                                    supported,
-                                    used_font_chunks,
-                                    chunk_split,
-                                    chunk_use_counts,
-                                    reused_chunk_ids,
-                                    max_reused_chunks,
-                                    cursors,
-                                    pending_candidates,
-                                    covered_rare_stacks,
-                                    tier=pool_key,
-                                    allow_reuse=allow_reuse,
-                                )
+                            for policy in repetition_policy_fallbacks(
+                                requested_repetition_policy
+                            ):
+                                pool_key = f"{tier}_{policy}_repetition"
+                                if pool_key not in difficulty_pools:
+                                    continue
+                                for allow_reuse in (False, True):
+                                    chunk = next_chunk_for_font(
+                                        font_info,
+                                        difficulty_pools[pool_key],
+                                        supported,
+                                        used_font_chunks,
+                                        chunk_split,
+                                        chunk_use_counts,
+                                        reused_chunk_ids,
+                                        max_reused_chunks,
+                                        cursors,
+                                        pending_candidates,
+                                        covered_rare_stacks,
+                                        tier=pool_key,
+                                        allow_reuse=allow_reuse,
+                                    )
+                                    if chunk is not None:
+                                        selected_repetition_policy = policy
+                                        break
                                 if chunk is not None:
                                     break
                             if chunk is not None:
@@ -931,7 +1220,7 @@ def make_plan_rows(
                                     split=split,
                                     requested_text_difficulty_tier=requested_tier,
                                     requested_text_repetition_policy=(
-                                        requested_repetition_policy
+                                        selected_repetition_policy
                                     ),
                                     selected_pool=tier,
                                 )
@@ -986,9 +1275,10 @@ def top_up_category_quotas(
     *,
     target_images: int,
     category_quota_overrides: dict[str, int] | None = None,
+    category_field: str = "script_8",
 ) -> list[dict[str, object]]:
     """Fill category shortfalls by auditable, split-aware round-robin reuse."""
-    categories = sorted({str(row["script_8"]) for row in rows})
+    categories = sorted({str(row[category_field]) for row in rows})
     quotas = category_quota_overrides or category_quotas(categories, target_images)
     if set(quotas) != set(categories) or sum(quotas.values()) != target_images:
         raise ValueError(
@@ -1001,7 +1291,7 @@ def top_up_category_quotas(
 
     additions: list[dict[str, object]] = []
     for category in categories:
-        category_rows = [row for row in prepared if row["script_8"] == category]
+        category_rows = [row for row in prepared if row[category_field] == category]
         deficit = quotas[category] - len(category_rows)
         if deficit <= 0:
             continue
@@ -1164,9 +1454,13 @@ def write_summary(rows: list[dict[str, object]], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     counts = {
         "script_category": Counter(row["script_category"] for row in rows),
+        "script_4": Counter(row.get("script_4") or "" for row in rows),
         "script": Counter(row["script"] for row in rows),
         "suggested_split": Counter(row["suggested_split"] for row in rows),
         "split_script_8": Counter(f"{row['suggested_split']}|{row['script_8']}" for row in rows),
+        "split_script_4": Counter(
+            f"{row['suggested_split']}|{row.get('script_4') or ''}" for row in rows
+        ),
         "script_id": Counter(row["script_id"] for row in rows),
         "basename": Counter(row["basename"] for row in rows),
         "font_name": Counter(row["font_name"] for row in rows),
@@ -1188,6 +1482,9 @@ def write_summary(rows: list[dict[str, object]], output: Path) -> None:
         "font_text_repetition_policy": Counter(
             f"{row['basename']}|{row['source_text_repetition_policy']}"
             for row in rows
+        ),
+        "text_length_bucket": Counter(
+            row.get("text_length_bucket") or "normal" for row in rows
         ),
     }
     reused_chunks = sum(1 for _chunk_id, count in Counter(row["chunk_id"] for row in rows).items() if count > 1)
@@ -1213,14 +1510,25 @@ def main() -> None:
         raise SystemExit(f"Missing support parquet: {args.support_parquet}")
 
     fonts = load_font_catalog(args.benchmark_csv, args.scripts_csv, args.fonts_csv)
+    if args.balance_by == "script_4":
+        fonts = prepare_script_4_fonts(fonts)
+        category_of = script_4_category_of
+        script_of = volume_aware_script_of
+    else:
+        category_of = default_category_of
+        script_of = default_script_of
     supported = load_supported_stacks(args.support_parquet)
     all_chunks = load_chunks(args.chunks)
     if not all_chunks:
         raise SystemExit(f"No chunks found in {args.chunks}")
-    chunks = filter_chunks_by_text_policy(
+    chunks = retention_chunks_for_repetition_bands(
         all_chunks,
         max_repetition_score=args.max_text_repetition_score,
         min_zstd_compression_ratio=args.min_zstd_compression_ratio,
+        repetitive_fraction=args.repetitive_fraction,
+        highly_repetitive_fraction=args.highly_repetitive_fraction,
+        repetitive_min_score=args.repetitive_min_score,
+        highly_repetitive_min_score=args.highly_repetitive_min_score,
     )
     if not chunks:
         raise SystemExit("Text policy excluded every source chunk")
@@ -1228,15 +1536,17 @@ def main() -> None:
         "Text policy retained "
         f"{len(chunks):,}/{len(all_chunks):,} chunks "
         f"(repetition < {args.max_text_repetition_score}, "
-        f"Zstd ratio >= {args.min_zstd_compression_ratio})"
+        f"Zstd ratio >= {args.min_zstd_compression_ratio}, "
+        f"repetitive={args.repetitive_fraction:.0%}/"
+        f"highly={args.highly_repetitive_fraction:.0%})"
     )
     eligible_categories = sorted(
         {
-            font.script_category
+            category_of(font)
             for font in fonts
             if font.basename in supported
-            and font.script_category
-            and normalized_script(font.script_type)
+            and category_of(font)
+            and script_of(font)
         }
     )
     explicit_quotas = parse_category_quotas(
@@ -1256,6 +1566,10 @@ def main() -> None:
             oversample_ume_dense=args.oversample_ume_dense,
             pair_shorthand_modes=args.pair_shorthand_modes,
             reward_repetition=not args.disable_rewarded_repetition,
+            repetitive_fraction=args.repetitive_fraction,
+            highly_repetitive_fraction=args.highly_repetitive_fraction,
+            repetitive_min_score=args.repetitive_min_score,
+            highly_repetitive_min_score=args.highly_repetitive_min_score,
         )
     else:
         if args.pair_shorthand_modes:
@@ -1270,13 +1584,29 @@ def main() -> None:
             oversample_ume_dense=args.oversample_ume_dense,
             reward_repetition=not args.disable_rewarded_repetition,
             category_quota_overrides=explicit_quotas,
+            repetitive_fraction=args.repetitive_fraction,
+            highly_repetitive_fraction=args.highly_repetitive_fraction,
+            repetitive_min_score=args.repetitive_min_score,
+            highly_repetitive_min_score=args.highly_repetitive_min_score,
+            category_of=category_of,
+            script_of=script_of,
         )
         if args.top_up_category_quotas:
             rows = top_up_category_quotas(
                 rows,
                 target_images=args.target_images,
                 category_quota_overrides=explicit_quotas,
+                category_field="script_4" if args.balance_by == "script_4" else "script_8",
             )
+    if args.short_length_fraction > 0 or args.long_length_fraction > 0:
+        rows = apply_length_bucket_rewrites(
+            rows,
+            chunks=chunks,
+            supported=supported,
+            short_fraction=args.short_length_fraction,
+            long_fraction=args.long_length_fraction,
+            seed=args.seed,
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, args.output, compression="zstd")

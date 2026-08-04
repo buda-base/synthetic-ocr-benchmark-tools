@@ -80,10 +80,96 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
         self.assertEqual(counts, Counter({"Font0": 18, "Font1": 18, "Font2": 18}))
         self.assertTrue(all(font["local_rate"] == 0.9 for font in manifest["fonts"]))
 
-    def test_bilevel_pages_replace_unsafe_local_effects(self) -> None:
+    def test_long_pages_use_lighter_augmentations(self) -> None:
+        rows = sample_rows(fonts=1, images_per_font=40)
+        for index, row in enumerate(rows):
+            if index % 4 == 0:
+                row["text_length_bucket"] = "long"
+        prepared, _manifest = assign_document_augmentations(
+            rows,
+            paper_backgrounds=sample_backgrounds(),
+            local_rate=1.0,
+            background_rate=1.0,
+            synthetic_paper_rate=0.0,
+            inkshifter_rate=1.0,
+            folding_rate=0.0,
+            rotation_rate=1.0,
+            tps_rate=0.5,
+            naturalization_b_rate=1.0,
+            seed=13,
+        )
+        long_rows = [
+            row for row in prepared if row.get("text_length_bucket") == "long"
+        ]
+        self.assertTrue(long_rows)
+        for row in long_rows:
+            self.assertEqual(row["document_augmentation_local"], "")
+            if row["document_augmentation_spatial"]:
+                self.assertEqual(row["document_augmentation_spatial_strength"], "mild")
+            if row["document_augmentation_rotation_strength"]:
+                self.assertEqual(row["document_augmentation_rotation_strength"], "typical")
+            if row["document_augmentation_tps_strength"]:
+                self.assertEqual(row["document_augmentation_tps_strength"], "typical")
+            self.assertIn(
+                row["document_augmentation_paper_source"], {"clean", "real"}
+            )
+            if row["document_augmentation_paper_source"] == "real":
+                self.assertEqual(
+                    row["document_augmentation_background_luminance_tier"], "light"
+                )
+            if row.get("raster_naturalization_profile"):
+                self.assertEqual(row["raster_naturalization_profile"], "A")
+
+    def test_dark_bilevel_backgrounds_excluded_for_middle_and_long(self) -> None:
+        from document_augmentation import (
+            BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE,
+            bilevel_background_allowed_for_bucket,
+        )
+        from paper_backgrounds import PaperBackground
+
+        dark = PaperBackground(
+            background_id="dark-bilevel",
+            w_id="W1",
+            i_id="I1",
+            i_version="v1",
+            filename="dark.tif",
+            source_s3_uri="s3://example/dark.tif",
+            width=400,
+            height=100,
+            display_width=400,
+            display_height=100,
+            aspect_ratio=4.0,
+            exif_orientation=None,
+            pil_mode="1",
+            size_bytes=100,
+            mean_luminance=BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE - 5,
+        )
+        bright = PaperBackground(
+            background_id="bright-bilevel",
+            w_id="W1",
+            i_id="I1",
+            i_version="v1",
+            filename="bright.tif",
+            source_s3_uri="s3://example/bright.tif",
+            width=400,
+            height=100,
+            display_width=400,
+            display_height=100,
+            aspect_ratio=4.0,
+            exif_orientation=None,
+            pil_mode="1",
+            size_bytes=100,
+            mean_luminance=BILEVEL_MIN_MEAN_LUMINANCE_FOR_DENSE + 1,
+        )
+        self.assertTrue(bilevel_background_allowed_for_bucket(dark, "short"))
+        self.assertFalse(bilevel_background_allowed_for_bucket(dark, "normal"))
+        self.assertFalse(bilevel_background_allowed_for_bucket(dark, "long"))
+        self.assertTrue(bilevel_background_allowed_for_bucket(bright, "long"))
+
+    def test_bilevel_pages_drop_ink_fading_local_effects(self) -> None:
         with patch(
             "document_augmentation.INK_EFFECT_WEIGHTS",
-            (("letterpress", 1.0),),
+            (("inkbleed", 1.0),),
         ):
             prepared, manifest = assign_document_augmentations(
                 sample_rows(fonts=1, images_per_font=20),
@@ -94,19 +180,18 @@ class DocumentAugmentationPolicyTests(unittest.TestCase):
                 seed=13,
             )
 
+        bilevel_rows = [
+            row
+            for row in prepared
+            if row["document_augmentation_output_mode"] == "1"
+        ]
+        self.assertTrue(bilevel_rows)
         self.assertTrue(
-            all(row["document_augmentation_output_mode"] == "1" for row in prepared)
-        )
-        self.assertTrue(
-            all(row["document_augmentation_local"] == "inkbleed" for row in prepared)
+            all(row["document_augmentation_local"] == "" for row in bilevel_rows)
         )
         self.assertEqual(
-            manifest["paper_policy"]["bilevel_local_effect_policy"]["replaced_effects"],
-            ["letterpress"],
-        )
-        self.assertEqual(
-            manifest["paper_policy"]["bilevel_local_effect_policy"]["replacement"],
-            "inkbleed",
+            manifest["paper_policy"]["bilevel_local_effect_policy"]["banned_effects"],
+            ["bleedthrough", "inkbleed", "letterpress"],
         )
 
     def test_policy_is_deterministic_and_excludes_removed_effects(self) -> None:
