@@ -54,6 +54,19 @@ def stack_missing_base_letter(stack: str) -> bool:
     return has_marks
 
 
+def is_tibetan_only(text: str) -> bool:
+    """True when every character is in the Tibetan Unicode block (U+0F00-U+0FFF).
+
+    Shorthand long forms and replacements must be pure Tibetan. Some source
+    rows are corrupted with stray Latin letters (``ê``, ``ö``, ``+`` ...) or
+    Private Use Area code points (e.g. U+F2007). ``tokenize_tibetan_stacks``
+    silently drops those when validating stacks, so without this guard the junk
+    would be spliced verbatim into both the rendered image and the ground-truth
+    transcription.
+    """
+    return all(0x0F00 <= ord(ch) <= 0x0FFF for ch in text)
+
+
 def load_shorthand_pairs(path: Path = DEFAULT_SHORTHANDS_CSV) -> list[ShorthandPair]:
     pairs: list[ShorthandPair] = []
     with path.open(encoding="utf-8-sig", newline="") as f:
@@ -62,6 +75,10 @@ def load_shorthand_pairs(path: Path = DEFAULT_SHORTHANDS_CSV) -> list[ShorthandP
             shorthand = (row.get("shorthand") or "").strip()
             source = (row.get("source") or "").strip()
             if not long_form or not shorthand:
+                continue
+            # Drop corrupted rows whose long form or shorthand carries any
+            # non-Tibetan character, so stray glyphs never reach the output.
+            if not is_tibetan_only(long_form) or not is_tibetan_only(shorthand):
                 continue
             stacks = tuple(tokenize_tibetan_stacks(shorthand))
             pairs.append(
