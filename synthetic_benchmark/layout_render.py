@@ -290,9 +290,10 @@ def render_page(
     block_labels: list[list[str]] = []
     pitches: list[float] = []
 
+    single_kind = lr.is_single_kind(layout.kind)
     for bi, block in enumerate(layout.blocks):
         b = replace(block, n_lines=eff[bi])
-        if layout.kind == "single":
+        if single_kind:
             box_w = _content_width_px(layout, eff[bi], b)
         else:
             m = b.margins
@@ -310,7 +311,7 @@ def render_page(
         block_labels.append(br.label_lines)
         pitches.append(br.pitch_px)
 
-    if layout.kind == "single":
+    if single_kind:
         image = block_imgs[0]
     elif layout.kind == "stack":
         image, _ = stack_blocks(block_imgs, layout.separators, pitches)

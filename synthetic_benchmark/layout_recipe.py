@@ -60,10 +60,25 @@ LINE_MAX = 60
 
 RATE_ALL_ZERO_MARGIN = 0.10
 RATE_ANY_ZERO_MARGIN = 0.30  # cumulative: includes the all-zero pages
+# Reserved fraction rendered in the *classic pecha* format (wide landscape
+# folio, generous margins on all sides, a handful of lines, no ragged / blank /
+# composite). Guards against pecha regression during fine-tuning. The remaining
+# (1 - RATE_PECHA) is split among the new-layout kinds at their relative rates.
+RATE_PECHA = 0.15
 RATE_PHOTO = 0.05
 RATE_STACK = 0.20
 RATE_RAGGED = 0.30
 RATE_BLANK = 0.10
+
+# Classic-pecha geometry (mimics the previous fixed-frame recipe).
+PECHA_ASPECT_MIN = 2.8
+PECHA_ASPECT_MAX = 6.0
+PECHA_MARGIN_MIN = 0.03
+PECHA_MARGIN_MAX = 0.10
+PECHA_LINES_MIN = 5
+PECHA_LINES_MAX = 12
+PECHA_GAP_MIN = 0.12
+PECHA_GAP_MAX = 0.35
 
 RAGGED_MIN_FRACTION = 0.20
 RAGGED_MAX_FRACTION = 0.60
@@ -236,6 +251,21 @@ def sample_block(
     )
 
 
+def sample_pecha_block(rng: random.Random) -> BlockSpec:
+    """A clean classic-pecha block: generous margins on all sides, moderate
+    pitch, a handful of lines, never ragged / blank."""
+    sides = [_loguniform(rng, PECHA_MARGIN_MIN, PECHA_MARGIN_MAX) for _ in range(4)]
+    return BlockSpec(
+        font_px=sample_font_px(rng),
+        gap_frac=_loguniform(rng, PECHA_GAP_MIN, PECHA_GAP_MAX),
+        n_lines=rng.randint(PECHA_LINES_MIN, PECHA_LINES_MAX),
+        margins=Margins(*sides),
+        ragged=False,
+        ragged_fraction=0.0,
+        blank_lines=False,
+    )
+
+
 def sample_separator(rng: random.Random) -> Separator:
     if rng.random() < RATE_SEPARATOR_BAR:
         return Separator(
@@ -258,9 +288,12 @@ def sample_separator(rng: random.Random) -> Separator:
 def sample_page_layout(seed: int, page_id: int) -> PageLayout:
     kind_rng = _rng(seed, page_id, "kind")
     u = kind_rng.random()
-    if u < RATE_PHOTO:
+    rest = 1.0 - RATE_PECHA
+    if u < RATE_PECHA:
+        kind = "pecha"
+    elif u < RATE_PECHA + rest * RATE_PHOTO:
         kind = "photo"
-    elif u < RATE_PHOTO + RATE_STACK:
+    elif u < RATE_PECHA + rest * (RATE_PHOTO + RATE_STACK):
         kind = "stack"
     else:
         kind = "single"
@@ -269,6 +302,13 @@ def sample_page_layout(seed: int, page_id: int) -> PageLayout:
     blank = _rng(seed, page_id, "blank").random() < RATE_BLANK
 
     block_rng = _rng(seed, page_id, "blocks")
+
+    if kind == "pecha":
+        aspect = _loguniform(_rng(seed, page_id, "aspect"), PECHA_ASPECT_MIN, PECHA_ASPECT_MAX)
+        block = sample_pecha_block(block_rng)
+        layout = PageLayout(page_id=page_id, kind="pecha", aspect=aspect, blocks=[block])
+        layout.real_background_allowed = True
+        return layout
 
     if kind == "single":
         aspect = sample_aspect(_rng(seed, page_id, "aspect"))
@@ -382,9 +422,14 @@ def _composite_dimensions_px(layout: PageLayout) -> tuple[float, float]:
     return width, height
 
 
+def is_single_kind(kind: str) -> bool:
+    """Single-block page kinds (one text column): new 'single' and 'pecha'."""
+    return kind in ("single", "pecha")
+
+
 def realize_dimensions_px(layout: PageLayout) -> tuple[float, float]:
     """Realised (width, height) in px, before the max-side cap."""
-    if layout.kind == "single":
+    if is_single_kind(layout.kind):
         return _single_dimensions_px(layout)
     return _composite_dimensions_px(layout)
 
@@ -431,7 +476,7 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
     if not n:
         return {}
 
-    kinds = {"single": 0, "stack": 0, "photo": 0}
+    kinds = {"pecha": 0, "single": 0, "stack": 0, "photo": 0}
     any_zero = all_zero = 0
     side_zero = {"left": 0, "right": 0, "top": 0, "bottom": 0}
     nonzero_margins: list[float] = []
@@ -509,6 +554,7 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
         "pages": n,
         "blocks": n_blocks,
         "composite_mix_pct": {
+            "pecha": pct(kinds["pecha"]),
             "single": pct(kinds["single"]),
             "stack": pct(kinds["stack"]),
             "photo": pct(kinds["photo"]),
