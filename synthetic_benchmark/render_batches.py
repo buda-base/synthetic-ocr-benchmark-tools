@@ -34,6 +34,11 @@ from font_augmentation_runtime import (
 )
 from font_variant_cache import DEFAULT_FONT_CACHE_URI
 from paper_backgrounds import DEFAULT_BACKGROUND_MANIFEST
+from ascii_digit_aug import (
+    apply_ascii_digits,
+    ascii_digit_count,
+    wrap_ascii_for_tex,
+)
 from shorthand_aug import (
     DEFAULT_DENYLIST_CSV,
     DEFAULT_SHORTHANDS_CSV,
@@ -51,6 +56,13 @@ from synthetic_common import (
     TSHEG,
     load_supported_stacks,
     tex_escape,
+)
+from yigchung import (
+    apply_yc_to_joined_units,
+    has_yc_tags,
+    split_yc_segments,
+    strip_yc_tags,
+    unit_yc_flags,
 )
 
 PAGE_PREFIX = "༄༅། །"
@@ -110,6 +122,22 @@ def parse_args() -> argparse.Namespace:
         "--enable-shorthands",
         action="store_true",
         help="Apply script-aware shorthand replacements before TeX (off by default until coverage review).",
+    )
+    parser.add_argument(
+        "--enable-ascii-digits",
+        action="store_true",
+        help="Inject ASCII digit spans (page marks, years, (1), ranges) and "
+        "render them with a Latin HarfBuzz face (no script=tibt).",
+    )
+    parser.add_argument("--ascii-digit-seed", type=int, default=13)
+    parser.add_argument("--ascii-digit-min", type=int, default=2)
+    parser.add_argument("--ascii-digit-max", type=int, default=6)
+    parser.add_argument(
+        "--yigchung-scale",
+        type=float,
+        default=0.72,
+        help="Intra-line yig chung size as a fraction of body font size "
+        "(W3C TLReq ~0.70–0.75). Used when plan text contains <yc>…</yc>.",
     )
     parser.add_argument("--shorthands", type=Path, default=DEFAULT_SHORTHANDS_CSV)
     parser.add_argument("--shorthand-denylist", type=Path, default=DEFAULT_DENYLIST_CSV)
@@ -291,6 +319,24 @@ def fontspec_options(row: dict[str, object]) -> str:
     return ",\n  ".join(parts)
 
 
+def latin_fontspec_options(row: dict[str, object]) -> str:
+    """Same face as the page font, but without script=tibt so 0-9 stay ASCII."""
+    font_path = resolve_font_path(row)
+    parts = [
+        f"Path={font_path.parent.as_posix()}/",
+        f"UprightFont={{{font_path.name}}}",
+        "Renderer=HarfBuzz",
+    ]
+    face_index = str(
+        row.get("render_ttc_face_index")
+        if row.get("render_ttc_face_index") is not None
+        else row.get("ttc_face_index") or ""
+    ).strip()
+    if face_index:
+        parts.append(f"FontIndex={face_index}")
+    return ",\n  ".join(parts)
+
+
 def split_marker_units(text: str) -> list[str]:
     units: list[str] = []
     buf: list[str] = []
@@ -308,13 +354,29 @@ def split_marker_units(text: str) -> list[str]:
     return units
 
 
-def add_marked_breakpoints(text: str) -> str:
+def add_marked_breakpoints(text: str, *, trailing_mark: bool = True) -> str:
     text = re.sub("་(?!།)", lambda _: "་\\syllmark\\allowbreak{}", text)
     text = text.replace(" ", "\\syllmark\\hspace{0.35em}\\allowbreak{}")
     # Keep generated TeX input lines short. The trailing % prevents inserted
     # source newlines from becoming visible inter-word spaces.
     text = text.replace("\\allowbreak{}", "\\allowbreak{}%\n")
-    return text + r"\syllmark{}"
+    if trailing_mark:
+        return text + r"\syllmark{}"
+    return text
+
+
+def wrap_yc_tex(text: str) -> str:
+    """Escape, insert syllable markers, and wrap ``<yc>`` runs in ``\\yigchung``."""
+    if not has_yc_tags(text):
+        return add_marked_breakpoints(tex_escape(text))
+    pieces: list[str] = []
+    for segment, is_yc in split_yc_segments(text):
+        marked = add_marked_breakpoints(tex_escape(segment), trailing_mark=False)
+        if is_yc and marked:
+            pieces.append(r"\yigchung{" + marked + "}")
+        else:
+            pieces.append(marked)
+    return "".join(pieces) + r"\syllmark{}"
 
 
 def lua_page_map_code(page_map_path: Path, line_map_path: Path) -> str:
@@ -415,6 +477,70 @@ local function collect_line_markers(head, lines)
   end
 end
 
+local function glyph_font_size(n)
+  if not n.font then
+    return 0
+  end
+  local ok, f = pcall(font.getfont, n.font)
+  if ok and f and f.size then
+    return f.size
+  end
+  return 0
+end
+
+local function raise_yigchung_glyphs(head)
+  local raise = 0
+  if tex.dimen and tex.dimen.ycheadraise then
+    raise = tex.dimen.ycheadraise
+  end
+  if raise == 0 then
+    return head
+  end
+  local function max_glyph_size(list)
+    local m = 0
+    if not list or type(list) == "number" then
+      return 0
+    end
+    for n in node.traverse(list) do
+      if n.id == glyph_id then
+        local sz = glyph_font_size(n)
+        if sz > m then m = sz end
+      elseif n.id == hlist_id or n.id == vlist_id then
+        local child = child_list(n)
+        local sz = max_glyph_size(child)
+        if sz > m then m = sz end
+      end
+    end
+    return m
+  end
+  local function raise_small(list, body_size)
+    if not list or type(list) == "number" or body_size == 0 then
+      return
+    end
+    for n in node.traverse(list) do
+      if n.id == glyph_id then
+        local sz = glyph_font_size(n)
+        if sz > 0 and sz < 0.92 * body_size then
+          n.yoffset = (n.yoffset or 0) + raise
+        end
+      elseif n.id == hlist_id or n.id == vlist_id then
+        raise_small(child_list(n), body_size)
+      end
+    end
+  end
+  if not head or type(head) == "number" then
+    return head
+  end
+  for line in node.traverse(head) do
+    if line.id == hlist_id and is_text_hlist(line) then
+      local child = child_list(line)
+      local body_size = max_glyph_size(child)
+      raise_small(child, body_size)
+    end
+  end
+  return head
+end
+
 local function expand_line_ink_extents(head)
   if not head or type(head) == "number" then
     return head
@@ -487,10 +613,13 @@ local function synthetic_pre_shipout_filter(head)
 end
 
 if luatexbase and luatexbase.add_to_callback then
+  luatexbase.add_to_callback("post_linebreak_filter", raise_yigchung_glyphs, "synthetic_yigchung_raise")
   luatexbase.add_to_callback("post_linebreak_filter", expand_line_ink_extents, "synthetic_line_extents")
   luatexbase.add_to_callback("pre_shipout_filter", synthetic_pre_shipout_filter, "synthetic_page_map")
 else
-  callback.register("post_linebreak_filter", expand_line_ink_extents)
+  callback.register("post_linebreak_filter", function(head)
+    return expand_line_ink_extents(raise_yigchung_glyphs(head))
+  end)
   callback.register("pre_shipout_filter", synthetic_pre_shipout_filter)
 end
 }}"""
@@ -509,13 +638,26 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
     height = args.page_height_mm
     width = height * args.page_ratio
     pages = []
+    default_yc_scale = float(getattr(args, "yigchung_scale", 0.72))
     for row in rows:
-        body = add_marked_breakpoints(tex_escape(str(row["text"])))
+        text = str(row["text"])
+        # Wrap digit runs before breakpoints so TeX dimen numbers (0.35em)
+        # are not captured. Macros contain only [0-9]+, so spaces in
+        # `— 42 —` stay outside and still get syllable markers.
+        if has_yc_tags(text):
+            body = wrap_yc_tex(text)
+        else:
+            escaped = tex_escape(text)
+            if getattr(args, "enable_ascii_digits", False):
+                escaped = wrap_ascii_for_tex(escaped)
+            body = add_marked_breakpoints(escaped)
         font_size = (
             float(row["font_size_pt"])
             * args.font_scale
             * float(row.get("layout_font_scale_multiplier") or 1.0)
         )
+        yc_scale = float(row.get("yigchung_scale") or default_yc_scale)
+        ycsize = font_size * yc_scale
         line_spacing_factor = float(row.get("layout_line_spacing_factor") or 1.25)
         baseline = font_size * line_spacing_factor
         margin_x_mm, margin_y_mm = _page_geometry_mm(row, args)
@@ -529,9 +671,42 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
             "\\noindent\n"
             f"\\directlua{{synthetic_set_chunk(\"{row['render_id']}\")}}\n"
             f"\\fontsize{{{fmt_dim(font_size)}pt}}{{{fmt_dim(baseline)}pt}}\\selectfont\n"
+            f"\\def\\ycsize{{{fmt_dim(ycsize)}pt}}\\yccalcheadraise\\typeout{{YC raise=\\the\\ycheadraise ycsize=\\ycsize}}\n"
             f"{body}\n"
             "\\clearpage\n"
         )
+    latin_block = ""
+    if getattr(args, "enable_ascii_digits", False):
+        latin_macro = r"\newcommand{\synthlatin}[1]{{\synthlatinfont #1}}"
+        latin_block = (
+            "\\newfontfamily\\synthlatinfont{DUMMY}[\n"
+            f"  {latin_fontspec_options(first)}\n"
+            "]\n"
+            f"{latin_macro}\n"
+        )
+    yc_macros = r"""
+\makeatletter
+\newattribute\ycattr
+\newdimen\ycheadraise
+\def\ycsize{10pt}
+\def\yccalcheadraise{%
+  \setbox0=\hbox{ཀ}%
+  \begingroup
+    \fontsize{\ycsize}{\baselineskip}\selectfont
+    \setbox2=\hbox{ཀ}%
+    \global\ycheadraise=\ht0
+    \global\advance\ycheadraise by -\ht2
+    \ifdim\ycheadraise<0pt \global\ycheadraise=0pt \fi
+  \endgroup
+}
+\def\yigchung#1{%
+  \bgroup
+  \fontsize{\ycsize}{\baselineskip}\selectfont
+  #1%
+  \egroup
+}
+\makeatother
+"""
     return rf"""\documentclass[12pt]{{article}}
 \pagestyle{{empty}}
 \usepackage{{fontspec}}
@@ -569,11 +744,11 @@ def make_tex(rows: list[dict[str, object]], args: argparse.Namespace, page_map_p
     end
   }}%
 }}
-{lua_page_map_code(page_map_path, page_map_path.with_suffix(".lines.csv"))}
+{yc_macros}{lua_page_map_code(page_map_path, page_map_path.with_suffix(".lines.csv"))}
 \setmainfont{{DUMMY}}[
   {fontspec_options(first)}
 ]
-\begin{{document}}
+{latin_block}\begin{{document}}
 {''.join(pages)}
 \end{{document}}
 """
@@ -675,6 +850,10 @@ def merge_rows(first: dict[str, object], second: dict[str, object]) -> dict[str,
     first["shorthand_count"] = int(first.get("shorthand_count") or 0) + int(
         second.get("shorthand_count") or 0
     )
+    first["ascii_digit_span_count"] = int(first.get("ascii_digit_span_count") or 0) + int(
+        second.get("ascii_digit_span_count") or 0
+    )
+    first["ascii_digit_count"] = ascii_digit_count(str(first.get("text") or ""))
     first["_source_chunk_ids"].extend(second["_source_chunk_ids"])
     first["_source_plan_image_ids"].extend(second["_source_plan_image_ids"])
     first["_source_bocorpus_rows"].extend(second["_source_bocorpus_rows"])
@@ -958,6 +1137,40 @@ def apply_shorthands_to_rows(
     return prepared
 
 
+def apply_ascii_digits_to_rows(
+    rows: list[dict[str, object]],
+    *,
+    enabled: bool,
+    seed: int,
+    n_min: int,
+    n_max: int,
+) -> list[dict[str, object]]:
+    prepared = []
+    for row in rows:
+        item = dict(row)
+        text = str(item.get("text") or "")
+        if not enabled:
+            item.setdefault("ascii_digit_span_count", 0)
+            item.setdefault("ascii_digit_count", ascii_digit_count(text))
+            prepared.append(item)
+            continue
+        try:
+            image_id = int(item.get("image_id") or 0)
+        except (TypeError, ValueError):
+            image_id = 0
+        new_text, n_spans = apply_ascii_digits(
+            text,
+            rng=random.Random(seed + image_id),
+            n_min=n_min,
+            n_max=n_max,
+        )
+        item["text"] = new_text
+        item["ascii_digit_span_count"] = n_spans
+        item["ascii_digit_count"] = ascii_digit_count(new_text)
+        prepared.append(item)
+    return prepared
+
+
 def strip_transcription_line_edges(text: str) -> str:
     """Strip leading/trailing spaces from each rendered transcription line."""
     return "\n".join(line.strip() for line in text.splitlines()).strip()
@@ -1109,6 +1322,8 @@ def write_text_and_catalog(
                 "unique_stack_count": row["unique_stack_count"],
                 "shorthand_count": row.get("shorthand_count", 0),
                 "shorthand_mode": row.get("shorthand_mode") or "none",
+                "ascii_digit_span_count": row.get("ascii_digit_span_count", 0),
+                "ascii_digit_count": row.get("ascii_digit_count", 0),
                 "font_augmentation_id": row.get("font_augmentation_id") or "",
                 "font_augmentation_specs": row.get("font_augmentation_specs") or "",
                 "font_augmentation_source_file": row.get("font_augmentation_source_file") or "",
@@ -1198,6 +1413,13 @@ def write_text_and_catalog(
                 "document_augmentation_seed": str(
                     row.get("document_augmentation_seed") or ""
                 ),
+                "yigchung_mode": str(row.get("yigchung_mode") or ""),
+                "yigchung_scale": (
+                    float(row["yigchung_scale"])
+                    if row.get("yigchung_scale") not in (None, "")
+                    else ""
+                ),
+                "basename": str(row.get("basename") or ""),
             }
         )
     return next_output_id
@@ -1213,17 +1435,27 @@ def rebuild_rendered_transcription(
     first_page: dict[str, object],
     lines_by_chunk_page: dict[tuple[str, int], list[list[int]]],
 ) -> str:
+    # Layout-recipe pages compute their exact per-line transcription directly
+    # (multi-chunk fill + composites make the marker-rebuild from a single
+    # row['text'] inapplicable), so honour an explicit override when present.
+    override = row.get("_rendered_transcription_override")
+    if override is not None:
+        return str(override)
+    raw = str(row["text"])
+    plain = strip_yc_tags(raw)
     physical_page = first_page.get("physical_page")
     try:
         page_no = int(physical_page)
     except (TypeError, ValueError):
-        return strip_transcription_line_edges(str(row["text"]))
+        return strip_transcription_line_edges(raw)
 
     line_marker_ids = lines_by_chunk_page.get((str(row["render_id"]), page_no), [])
     if not line_marker_ids:
-        return strip_transcription_line_edges(str(row["text"]))
+        return strip_transcription_line_edges(raw)
 
-    units = split_marker_units(str(row["text"]))
+    units = split_marker_units(plain)
+    tagged = has_yc_tags(raw)
+    flags = unit_yc_flags(raw, units) if tagged else None
     lines: list[str] = []
     previous_end = 0
     for ids in line_marker_ids:
@@ -1232,13 +1464,15 @@ def rebuild_rendered_transcription(
         end = min(max(ids), len(units))
         if end <= previous_end:
             continue
-        line = "".join(units[previous_end:end]).strip()
+        chunk = units[previous_end:end]
+        if tagged and flags is not None:
+            line = apply_yc_to_joined_units(chunk, flags[previous_end:end]).strip()
+        else:
+            line = "".join(chunk).strip()
         if line:
             lines.append(line)
         previous_end = end
-    return strip_transcription_line_edges("\n".join(lines)) or strip_transcription_line_edges(
-        str(row["text"])
-    )
+    return strip_transcription_line_edges("\n".join(lines)) or strip_transcription_line_edges(raw)
 
 
 def compile_batch(
@@ -1301,6 +1535,13 @@ def render_batch(
         supported_by_font=getattr(args, "_supported_stacks", None),
         max_per_100=float(getattr(args, "shorthand_max_per_100", 4.0)),
         seed=int(getattr(args, "shorthand_seed", 13)),
+    )
+    render_rows = apply_ascii_digits_to_rows(
+        render_rows,
+        enabled=bool(getattr(args, "enable_ascii_digits", False)),
+        seed=int(getattr(args, "ascii_digit_seed", 13)),
+        n_min=int(getattr(args, "ascii_digit_min", 2)),
+        n_max=int(getattr(args, "ascii_digit_max", 6)),
     )
     compile_result = None
     pages_by_chunk: dict[str, list[dict[str, int]]] = {}
@@ -1862,6 +2103,13 @@ def write_benchmark_metadata(out_dir: Path, catalog_rows: list[dict[str, object]
                 "document_augmentation_tps_offsets_height": str(
                     row.get("document_augmentation_tps_offsets_height") or ""
                 ),
+                "yigchung_mode": str(row.get("yigchung_mode") or ""),
+                "yigchung_scale": (
+                    float(row["yigchung_scale"])
+                    if row.get("yigchung_scale") not in (None, "")
+                    else None
+                ),
+                "basename": str(row.get("basename") or ""),
             }
             for row in sorted(group_rows, key=catalog_sort_key)
         ]
