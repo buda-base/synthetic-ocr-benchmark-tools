@@ -232,6 +232,10 @@ def build_body(text: str, block: lr.BlockSpec, rng) -> str:
     out: list[str] = []
     i = 0
     n = len(units)
+    blanks = 0
+    # First guaranteed blank after this many paragraphs, so a blank-line page
+    # reliably shows one empty row inside the visible frame.
+    first_blank_at = rng.randint(2, 4)
     while i < n:
         if block.ragged and rng.random() < block.ragged_fraction:
             k = rng.randint(1, 3)
@@ -244,8 +248,14 @@ def build_body(text: str, block: lr.BlockSpec, rng) -> str:
             chunk = "".join(units[i : i + k])
             out.append(rb.add_marked_breakpoints(tex_escape(chunk)) + r"\par")
             i += k
-        if block.blank_lines and rng.random() < 0.12:
-            out.append(r"\vspace{\baselineskip}\mbox{}\par")
+        if block.blank_lines:
+            paras = len([p for p in out if not p.startswith(r"\strut")])
+            want = (blanks == 0 and paras >= first_blank_at) or rng.random() < 0.15
+            if want:
+                # \strut = a full-height, ink-less line => a true blank row with
+                # no syllable marker, so the label machinery skips it.
+                out.append(r"\strut\par")
+                blanks += 1
     return "\n".join(out)
 
 
