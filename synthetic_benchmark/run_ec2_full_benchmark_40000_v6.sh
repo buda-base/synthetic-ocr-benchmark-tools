@@ -176,6 +176,9 @@ mkdir -p "$OUT"
   --volume-version "$VOLUME_VERSION" \
   --benchmark-version "$BENCHMARK_VERSION" \
   --dataset-id "$DATASET_ID" \
+  --layout-recipe \
+  --layout-dpi 200 \
+  --layout-chunks "$CHUNKS" \
   --document-augmentation \
   --enable-shorthands \
   --support-parquet "$SUPPORT" \
