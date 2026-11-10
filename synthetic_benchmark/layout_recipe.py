@@ -46,15 +46,22 @@ from typing import Optional
 
 MARGIN_MAX = 0.15
 MARGIN_MIN = 0.005
-ASPECT_MIN = 0.06
-ASPECT_MAX = 12.0
+ASPECT_MIN = 0.09
+ASPECT_MAX = 10.0
 GAP_MIN = 0.05
 GAP_MAX = 0.60
-# Glyph size in output px. Raised from the earlier 12-28 "px equivalent": QC
-# review found those too small / too many characters per page. ~42 px was
-# approved as "much better", so the range is centred there.
-FONT_PX_MIN = 30.0
-FONT_PX_MAX = 56.0
+# Glyph size as a *normalized* knob, not raw output px. The renderer multiplies
+# it by the per-font ``font_size_pt / FONT_SIZE_PT_REFERENCE`` density factor so
+# the effective em is visually consistent across fonts (thin cursive scripts get
+# scaled up, sprawling drutsa scaled down). A flat em left thin yigchung fonts
+# with a ~6 px readable body while plain fonts had ~16 px; normalization closes
+# that ~3x gap. Floor 44 => ~22-24 px body on a plain font; cursive never below
+# ~60 px effective em. QC-approved via per-font legibility review.
+FONT_PX_MIN = 44.0
+FONT_PX_MAX = 68.0
+# Reference point size that ``font_size_pt`` normalizes against (the mode / the
+# get_adjusted_font_size.py DEFAULT_FONT_SIZE). effective_em = knob * pt / ref.
+FONT_SIZE_PT_REFERENCE = 24.0
 LINE_MIN = 1
 LINE_MAX = 60
 
@@ -110,7 +117,7 @@ REAL_BG_ASPECT_MAX = 3.5
 # Hard cap on the longer image side after realisation. Extreme aspect x line
 # count combinations are brought into budget by TRIMMING CONTENT (fewer lines),
 # never by shrinking the glyphs -- so the approved font size is always preserved.
-MAX_IMAGE_SIDE_PX = 4000
+MAX_IMAGE_SIDE_PX = 3500
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +432,26 @@ def _composite_dimensions_px(layout: PageLayout) -> tuple[float, float]:
 def is_single_kind(kind: str) -> bool:
     """Single-block page kinds (one text column): new 'single' and 'pecha'."""
     return kind in ("single", "pecha")
+
+
+def apply_font_size_normalization(layout: PageLayout, font_size_pt: float) -> float:
+    """Scale every block's ``font_px`` so the effective em is visually consistent
+    across fonts, using the per-font density factor ``font_size_pt / REFERENCE``.
+
+    Mutates ``layout`` in place (so all downstream geometry / fill / render read
+    the normalized em) and returns the applied factor. Pure no-op at the
+    reference point size.
+    """
+    try:
+        factor = float(font_size_pt) / FONT_SIZE_PT_REFERENCE
+    except (TypeError, ValueError):
+        factor = 1.0
+    if not (factor > 0):
+        factor = 1.0
+    if factor != 1.0:
+        for block in layout.blocks:
+            block.font_px *= factor
+    return factor
 
 
 def realize_dimensions_px(layout: PageLayout) -> tuple[float, float]:

@@ -1269,6 +1269,8 @@ def write_text_and_catalog(
                 "layout_recipe_realized_line_count": (
                     row.get("layout_realized_line_count") or ""
                 ),
+                "layout_recipe_font_norm_factor": row.get("layout_font_norm_factor") or "",
+                "layout_recipe_effective_em_px": row.get("layout_effective_em_px") or "",
                 "transcription": text,
                 "source_plan_image_ids": "|".join(row["_source_plan_image_ids"]),
                 "page_prefix_added": row.get("page_prefix_added", 0),
@@ -1596,6 +1598,11 @@ def render_batch_layout(
         except (TypeError, ValueError):
             image_id = next_output_id
         layout = _lr.sample_page_layout(seed, image_id)
+        # Normalize the glyph em per font so visual size is consistent across
+        # fonts (thin cursive scripts scaled up, sprawling drutsa scaled down).
+        font_norm = _lr.apply_font_size_normalization(
+            layout, row.get("font_size_pt") or _lr.FONT_SIZE_PT_REFERENCE
+        )
         plan = _lrd.page_block_plan(layout)
         needs = [
             _lfill.estimate_needed_chars(p["box_w_px"], p["font_px"], p["eff_lines"])
@@ -1684,6 +1691,9 @@ def render_batch_layout(
         row["layout_aspect_sampled"] = round(float(layout.aspect), 4)
         row["layout_block_count"] = len(layout.blocks)
         row["layout_realized_line_count"] = realized
+        row["layout_font_norm_factor"] = round(float(font_norm), 4)
+        _eff_em = info.get("font_px") or []
+        row["layout_effective_em_px"] = round(float(_eff_em[0]), 1) if _eff_em else ""
 
         output_id = image_id
         dest = args.out_dir / benchmark_image_relpath(
