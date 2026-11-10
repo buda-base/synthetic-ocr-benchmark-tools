@@ -50,8 +50,11 @@ ASPECT_MIN = 0.06
 ASPECT_MAX = 12.0
 GAP_MIN = 0.05
 GAP_MAX = 0.60
-FONT_PX_MIN = 12.0
-FONT_PX_MAX = 28.0
+# Glyph size in output px. Raised from the earlier 12-28 "px equivalent": QC
+# review found those too small / too many characters per page. ~42 px was
+# approved as "much better", so the range is centred there.
+FONT_PX_MIN = 30.0
+FONT_PX_MAX = 56.0
 LINE_MIN = 1
 LINE_MAX = 60
 
@@ -89,9 +92,9 @@ PHOTO_FOLIO_WIDTH_PX_MAX = 1800.0
 REAL_BG_ASPECT_MIN = 0.30
 REAL_BG_ASPECT_MAX = 3.5
 
-# Hard cap on the longer image side after realisation; extreme aspect x line
-# count combinations are downscaled into this budget (realised font px is then
-# recorded, and may dip below 12 on the most extreme pages).
+# Hard cap on the longer image side after realisation. Extreme aspect x line
+# count combinations are brought into budget by TRIMMING CONTENT (fewer lines),
+# never by shrinking the glyphs -- so the approved font size is always preserved.
 MAX_IMAGE_SIDE_PX = 4000
 
 
@@ -387,13 +390,24 @@ def realize_dimensions_px(layout: PageLayout) -> tuple[float, float]:
 
 
 def capped_dimensions_px(layout: PageLayout) -> tuple[float, float, float]:
-    """Return (width, height, scale) after clamping the longer side to the cap."""
+    """Return (width, height, content_scale) after clamping the longer side.
+
+    ``content_scale`` <= 1 is applied to the *line count* (content), NOT the
+    glyph size: image dimensions scale with the number of rendered lines, so
+    trimming lines shrinks the page while the font px stays exactly as sampled.
+    """
     width, height = realize_dimensions_px(layout)
     longer = max(width, height)
     scale = 1.0
     if longer > MAX_IMAGE_SIDE_PX:
         scale = MAX_IMAGE_SIDE_PX / longer
     return width * scale, height * scale, scale
+
+
+def effective_line_counts(layout: PageLayout) -> list[int]:
+    """Per-block line count after the size cap trims content (font preserved)."""
+    _, _, scale = capped_dimensions_px(layout)
+    return [max(1, int(round(block.n_lines * scale))) for block in layout.blocks]
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +445,7 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
     ragged_pages = blank_pages = 0
     sep_bar = sep_gap = 0
     capped = 0
-    realized_font_px: list[float] = []
+    realized_line_counts: list[float] = []
 
     for layout in layouts:
         kinds[layout.kind] += 1
@@ -483,8 +497,8 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
         _, _, scale = capped_dimensions_px(layout)
         if scale < 1.0:
             capped += 1
-        for block in layout.blocks:
-            realized_font_px.append(block.font_px * scale)
+        for eff in effective_line_counts(layout):
+            realized_line_counts.append(float(eff))
 
     n_blocks = len(line_counts)
 
@@ -517,8 +531,8 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
             "gt_15_pct_of_blocks": pct(lines_gt15, n_blocks),
             "quantiles": _quantiles([float(v) for v in line_counts]),
         },
-        "font_px": {"quantiles": _quantiles(font_px)},
-        "realized_font_px_after_cap": {"quantiles": _quantiles(realized_font_px)},
+        "font_px": {"quantiles": _quantiles(font_px), "note": "preserved; cap trims content not glyphs"},
+        "realized_line_count_after_cap": {"quantiles": _quantiles(realized_line_counts)},
         "inter_line_gap": {
             "tight_le_0.15_pct_of_blocks": pct(gap_tight, n_blocks),
             "quantiles": _quantiles(gaps),
@@ -530,7 +544,7 @@ def summarize_layouts(layouts: list[PageLayout]) -> dict:
             "gap_pct": pct(sep_gap, max(1, sep_bar + sep_gap)),
             "total": sep_bar + sep_gap,
         },
-        "pages_downscaled_by_cap_pct": pct(capped),
+        "pages_line_trimmed_by_cap_pct": pct(capped),
     }
 
 
