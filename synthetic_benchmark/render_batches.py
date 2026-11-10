@@ -230,6 +230,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pdftoppm", default="pdftoppm")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--jobs", type=int, default=1, help="Number of batches to render in parallel")
+    parser.add_argument(
+        "--layout-recipe",
+        action="store_true",
+        help=(
+            "Render each page with the v6 per-page layout recipe (layout_recipe + "
+            "layout_render) instead of the fixed pecha frame. Geometry/composites are "
+            "sampled from (--layout-seed, image_id); text is filled contiguously to "
+            "the frame; the exact per-line label is injected into the catalog."
+        ),
+    )
+    parser.add_argument("--layout-seed", type=int, default=13)
+    parser.add_argument(
+        "--layout-dpi",
+        type=int,
+        default=200,
+        help="Render DPI for the layout path (does not change output px: font_pt compensates).",
+    )
+    parser.add_argument(
+        "--layout-chunks",
+        type=Path,
+        default=None,
+        help="Chunks parquet used for contiguous text fill (defaults to --... render plan's chunks / DEFAULT_CHUNKS_PARQUET).",
+    )
     return parser.parse_args()
 
 
@@ -1239,6 +1262,13 @@ def write_text_and_catalog(
                     row.get("layout_font_scale_multiplier") or 1.0
                 ),
                 "layout_density_tier": row.get("layout_density_tier") or "",
+                "layout_recipe_kind": row.get("layout_kind") or "",
+                "layout_recipe_aspect_sampled": row.get("layout_aspect_sampled") or "",
+                "layout_recipe_aspect_realized": row.get("layout_aspect_realized") or "",
+                "layout_recipe_block_count": row.get("layout_block_count") or "",
+                "layout_recipe_realized_line_count": (
+                    row.get("layout_realized_line_count") or ""
+                ),
                 "transcription": text,
                 "source_plan_image_ids": "|".join(row["_source_plan_image_ids"]),
                 "page_prefix_added": row.get("page_prefix_added", 0),
@@ -1513,12 +1543,201 @@ def compile_batch(
     return parse_page_map(page_map_path), parse_line_map(line_map_path), pdf_path
 
 
+# Set once in main() when --layout-recipe is active; forked render workers
+# inherit it (built before the process pool is created).
+_LAYOUT_CHUNK_INDEX = None
+
+
+def render_batch_layout(
+    rows: list[dict[str, object]],
+    args: argparse.Namespace,
+    catalog_rows: list[dict[str, object]],
+    next_output_id: int,
+) -> tuple[bool, int]:
+    """Render a batch of pages with the v6 per-page layout recipe.
+
+    Each row becomes one page whose geometry/composite layout is sampled
+    deterministically from (layout_seed, image_id). Text is filled contiguously
+    to the frame, shorthands applied, and the page rendered via layout_render
+    with the row's (variant) font. The resulting grayscale page + exact per-line
+    label are fed into the SAME document-augmentation + catalog machinery as the
+    fixed-frame path (via the _rendered_transcription_override hook).
+    """
+    import shutil as _shutil
+
+    import cv2 as _cv2
+
+    import layout_recipe as _lr
+    import layout_render as _lrd
+    import layout_fill as _lfill
+
+    index = _LAYOUT_CHUNK_INDEX
+    if index is None:
+        raise RuntimeError("layout chunk index not initialised")
+
+    batch_id = rows[0]["batch_id"]
+    batch_dir = args.out_dir / "batches"
+    log_dir = args.out_dir / "logs"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    work = batch_dir / f"{batch_id}_layout"
+    work.mkdir(parents=True, exist_ok=True)
+
+    render_rows = prepare_rows(rows)
+    seed = int(getattr(args, "layout_seed", 13))
+    dpi = int(getattr(args, "layout_dpi", 200))
+
+    pages_by_chunk: dict[str, list[dict[str, int]]] = {}
+    ok_rows: list[dict[str, object]] = []
+
+    for row in render_rows:
+        try:
+            image_id = int(row["image_id"])
+        except (TypeError, ValueError):
+            image_id = next_output_id
+        layout = _lr.sample_page_layout(seed, image_id)
+        plan = _lrd.page_block_plan(layout)
+        needs = [
+            _lfill.estimate_needed_chars(p["box_w_px"], p["font_px"], p["eff_lines"])
+            for p in plan
+        ]
+        primary_chunk_id = str(
+            row.get("chunk_id")
+            or (row.get("_source_chunk_ids") or [""])[0]
+        )
+        filled = _lfill.fill_page(index, primary_chunk_id, needs)
+
+        block_texts: list[str] = []
+        shorthand_total = 0
+        for fb in filled:
+            tmp = {**row, "text": fb.text}
+            expanded = apply_shorthands_to_rows(
+                [tmp],
+                enabled=bool(getattr(args, "enable_shorthands", False)),
+                pairs=getattr(args, "_shorthand_pairs", []),
+                denylist=getattr(args, "_shorthand_denylist", []),
+                supported_by_font=getattr(args, "_supported_stacks", None),
+                max_per_100=float(getattr(args, "shorthand_max_per_100", 4.0)),
+                seed=int(getattr(args, "shorthand_seed", 13)),
+            )[0]
+            block_texts.append(str(expanded.get("text") or ""))
+            shorthand_total += int(expanded.get("shorthand_count") or 0)
+
+        font_path = resolve_font_path(row)
+        face_index = str(
+            row.get("render_ttc_face_index")
+            if row.get("render_ttc_face_index") is not None
+            else row.get("ttc_face_index") or ""
+        ).strip()
+
+        try:
+            result = _lrd.render_page(
+                layout,
+                block_texts,
+                font_path=font_path,
+                dpi=dpi,
+                workdir=work,
+                seed=seed,
+                face_index=face_index,
+            )
+        except Exception as exc:  # pragma: no cover - defensive per-page guard
+            print(f"WARNING: layout render crashed for image {image_id}: {exc}")
+            result = None
+        if result is None:
+            print(f"WARNING: layout render failed for image {image_id}")
+            continue
+        image, label, info = result
+        realized = sum(info.get("realized_lines") or []) or 0
+        if realized <= 0:
+            print(f"WARNING: image {image_id} rendered 0 lines; skipping")
+            continue
+
+        src = work / f"src_{image_id}.jpg"
+        _cv2.imwrite(str(src), image)
+
+        # Plumb the exact label + realized geometry into the shared catalog path.
+        row["_rendered_transcription_override"] = label
+        row["output_width_px"] = int(image.shape[1])  # native size; no resize
+        pages_by_chunk[str(row["render_id"])] = [
+            {"physical_page": 1, "line_count": realized}
+        ]
+        row["shorthand_count"] = shorthand_total
+
+        flat_ids: list[str] = []
+        flat_bo: list[str] = []
+        flat_ranges: list[str] = []
+        flat_etext: list[str] = []
+        for fb in filled:
+            flat_ids.extend(fb.chunk_ids)
+            flat_bo.extend(fb.bocorpus_rows)
+            flat_ranges.extend(fb.char_ranges)
+            for bo, rg in zip(fb.bocorpus_rows, fb.char_ranges):
+                flat_etext.append(f"bocorpus:{bo}:{rg}")
+        if flat_ids:
+            row["_source_chunk_ids"] = flat_ids
+            row["_source_bocorpus_rows"] = flat_bo
+            row["_source_char_ranges"] = flat_ranges
+            row["_source_etext_sources"] = flat_etext
+
+        row["layout_kind"] = layout.kind
+        row["layout_aspect_realized"] = info.get("aspect_realized")
+        row["layout_aspect_sampled"] = round(float(layout.aspect), 4)
+        row["layout_block_count"] = len(layout.blocks)
+        row["layout_realized_line_count"] = realized
+
+        output_id = image_id
+        dest = args.out_dir / benchmark_image_relpath(
+            output_id,
+            str(row.get("document_augmentation_output_extension") or ".jpg"),
+        )
+        if getattr(args, "document_augmentation", False):
+            from document_augmentation import (
+                apply_document_augmentations,
+                enforce_background_readability_for_line_count,
+            )
+
+            enforce_background_readability_for_line_count(row, realized)
+            apply_document_augmentations(
+                src,
+                dest,
+                row,
+                jpeg_quality=int(row.get("output_jpeg_quality") or args.jpeg_quality),
+            )
+        else:
+            from document_augmentation import apply_raster_naturalization
+
+            apply_raster_naturalization(
+                src,
+                dest,
+                row,
+                jpeg_quality=int(row.get("output_jpeg_quality") or args.jpeg_quality),
+            )
+        for alternative_extension in (".jpg", ".tif"):
+            alternative = dest.with_suffix(alternative_extension)
+            if alternative != dest:
+                alternative.unlink(missing_ok=True)
+        ok_rows.append(row)
+
+    next_output_id = write_text_and_catalog(
+        ok_rows,
+        args.out_dir,
+        catalog_rows,
+        pages_by_chunk,
+        {},
+        next_output_id,
+    )
+    _shutil.rmtree(work, ignore_errors=True)
+    return (len(ok_rows) > 0), next_output_id
+
+
 def render_batch(
     rows: list[dict[str, object]],
     args: argparse.Namespace,
     catalog_rows: list[dict[str, object]],
     next_output_id: int,
 ) -> tuple[bool, int]:
+    if getattr(args, "layout_recipe", False):
+        return render_batch_layout(rows, args, catalog_rows, next_output_id)
     batch_id = rows[0]["batch_id"]
     batch_dir = args.out_dir / "batches"
     log_dir = args.out_dir / "logs"
@@ -2611,6 +2830,29 @@ def main() -> None:
             font_scale=args.font_scale,
             seed=args.document_augmentation_seed,
         )
+        if getattr(args, "layout_recipe", False):
+            # Gate real-paper backgrounds to layout-appropriate pages: extreme
+            # aspect singles (very tall/wide strips) look wrong on a photographed
+            # folio, so downgrade them to a clean paper. Composites/pecha/book
+            # keep their assigned real backgrounds.
+            import layout_recipe as _lr_gate
+
+            downgraded = 0
+            for row in rows:
+                try:
+                    _iid = int(row["image_id"])
+                except (TypeError, ValueError):
+                    continue
+                _layout = _lr_gate.sample_page_layout(int(args.layout_seed), _iid)
+                if (
+                    not _layout.real_background_allowed
+                    and str(row.get("document_augmentation_paper_source") or "") == "real"
+                ):
+                    row["document_augmentation_paper_source"] = "clean"
+                    downgraded += 1
+            print(
+                f"[layout] gated real backgrounds off {downgraded} aspect-inappropriate page(s)"
+            )
         document_manifest["paper_policy"]["manifest_path"] = str(
             args.paper_background_manifest
         )
@@ -2636,6 +2878,16 @@ def main() -> None:
             f"--font-augmentation-variants must be between 0 and "
             f"{MAX_FONT_AUGMENTATION_VARIANTS}"
         )
+
+    if getattr(args, "layout_recipe", False):
+        global _LAYOUT_CHUNK_INDEX
+        from layout_fill import ChunkIndex
+        from synthetic_common import DEFAULT_CHUNKS_PARQUET as _DEFAULT_CHUNKS
+
+        chunks_path = args.layout_chunks or _DEFAULT_CHUNKS
+        with timed_stage(f"Load layout chunk index ({chunks_path})"):
+            _LAYOUT_CHUNK_INDEX = ChunkIndex.load(Path(chunks_path))
+        print(f"[layout] chunk index ready: {len(_LAYOUT_CHUNK_INDEX.ordered):,} chunks")
 
     augmentation_cache: Path | None = None
     rendering_finished = False

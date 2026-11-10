@@ -83,9 +83,18 @@ def _build_block_tex(
     body: str,
     tight: bool,
     page_map_path: Path,
+    face_index: str = "",
 ) -> str:
     lua = rb.lua_page_map_code(page_map_path, page_map_path.with_suffix(".lines.csv"))
     lineskiplimit = "-20pt" if tight else "0.5pt"
+    font_opts = [
+        f"Path={font_path.parent.as_posix()}/",
+        "Renderer=HarfBuzz",
+        "RawFeature={script=tibt}",
+    ]
+    if str(face_index).strip():
+        font_opts.append(f"FontIndex={str(face_index).strip()}")
+    font_opts_str = ",".join(font_opts)
     return rf"""\documentclass{{article}}
 \usepackage{{fontspec}}
 \usepackage[paperwidth={_fmt(paper_w_mm)}mm,paperheight={_fmt(paper_h_mm)}mm,left={_fmt(pad_mm)}mm,top={_fmt(pad_mm)}mm,textwidth={_fmt(tw_mm)}mm,textheight={_fmt(th_mm)}mm]{{geometry}}
@@ -98,7 +107,7 @@ def _build_block_tex(
 \pretolerance=9999
 {_SYLL_MACROS}
 {lua}
-\setmainfont{{{font_path.name}}}[Path={font_path.parent.as_posix()}/,Renderer=HarfBuzz,RawFeature={{script=tibt}}]
+\setmainfont{{{font_path.name}}}[{font_opts_str}]
 \begin{{document}}
 \fontsize{{{_fmt(font_pt)}pt}}{{{_fmt(baseline_pt)}pt}}\selectfont
 \directlua{{synthetic_set_chunk("{block_id}")}}
@@ -271,6 +280,35 @@ def _content_width_px(layout: lr.PageLayout, eff_lines: int, block: lr.BlockSpec
     return max(60.0, width - (m.left + m.right) * shorter)
 
 
+def _block_box_w(layout: lr.PageLayout, bi: int, block: lr.BlockSpec, eff_lines: int) -> float:
+    if lr.is_single_kind(layout.kind):
+        return _content_width_px(layout, eff_lines, block)
+    m = block.margins
+    return max(60.0, float(layout.target_width_px or 1200.0) * (1.0 - m.left - m.right))
+
+
+def page_block_plan(layout: lr.PageLayout) -> list[dict]:
+    """Per-block (box_w_px, eff_lines, font_px) matching render_page's geometry.
+
+    Used by the fill estimator so text length is sized to the actual column that
+    will be rendered.
+    """
+    from dataclasses import replace
+
+    eff = lr.effective_line_counts(layout)
+    out = []
+    for bi, block in enumerate(layout.blocks):
+        b = replace(block, n_lines=eff[bi])
+        out.append(
+            {
+                "box_w_px": _block_box_w(layout, bi, b, eff[bi]),
+                "eff_lines": eff[bi],
+                "font_px": b.font_px,
+            }
+        )
+    return out
+
+
 def render_page(
     layout: lr.PageLayout,
     texts: list[str],
@@ -279,6 +317,7 @@ def render_page(
     dpi: int,
     workdir: Path,
     seed: int,
+    face_index: str = "",
 ):
     """Render a full page (single/stack/photo). ``texts`` supplies one
     over-provided text per block. Returns (gray_image, label, info)."""
@@ -302,6 +341,7 @@ def render_page(
         br = _render_prebuilt_body(
             b, body, texts[bi], box_w_px=box_w, font_path=font_path,
             dpi=dpi, workdir=workdir, block_id=f"p{layout.page_id}_b{bi}",
+            face_index=face_index,
         )
         if br is None:
             return None
@@ -336,7 +376,8 @@ def _margins_tuple(m: lr.Margins):
 
 
 def _render_prebuilt_body(
-    block, body, plain_text, *, box_w_px, font_path, dpi, workdir, block_id, pad_mm: float = 6.0,
+    block, body, plain_text, *, box_w_px, font_path, dpi, workdir, block_id,
+    pad_mm: float = 6.0, face_index: str = "",
 ) -> BlockRender | None:
     """Like render_block but the LaTeX body is already built (ragged/blank aware)."""
     workdir.mkdir(parents=True, exist_ok=True)
@@ -355,6 +396,7 @@ def _render_prebuilt_body(
         paper_w_mm=paper_w, paper_h_mm=paper_h, pad_mm=pad_mm,
         tw_mm=tw_mm, th_mm=th_mm, block_id=block_id, body=body,
         tight=tight, page_map_path=workdir / f"{block_id}.pages.csv",
+        face_index=face_index,
     )
     texf = workdir / f"{block_id}.tex"
     texf.write_text(tex, encoding="utf-8")
